@@ -32,6 +32,13 @@ const SHOW_TIMEOUT: Duration = Duration::from_secs(5);
 /// toasts with no click listener.
 const CLICK_WAIT_SAFETY_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
+/// Freedesktop default-action button label (Linux). Body click maps to the
+/// same default action on daemons that support it.
+const FOCUS_ACTION_LABEL: &str = "Open in Herdr";
+
+/// Shown under the location line so body-click is discoverable, not only the button.
+const FOCUS_HINT: &str = "Click notification or “Open in Herdr” to jump there.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Sound {
     None,
@@ -138,6 +145,15 @@ fn format_notification_body(workspace: &str, tab: &str, title: &str, agent: &str
                 agent.to_string()
             }
         }
+    }
+}
+
+/// Append the focus hint used on clickable (event) toasts.
+fn with_focus_hint(body: &str) -> String {
+    if body.is_empty() {
+        FOCUS_HINT.to_string()
+    } else {
+        format!("{body}\n{FOCUS_HINT}")
     }
 }
 
@@ -275,7 +291,7 @@ fn run_event() -> Result<(), ()> {
     }
 
     let (workspace, tab) = resolve_location(&pane_id, &workspace_id);
-    let body = format_notification_body(&workspace, &tab, &title, &agent);
+    let body = with_focus_hint(&format_notification_body(&workspace, &tab, &title, &agent));
 
     send_notification(&summary, &body, sound, Some(&pane_id))
 }
@@ -357,7 +373,7 @@ fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Opti
             // XFCE (and most Linux notify daemons) only emit ActionInvoked on
             // body-click when a "default" action is registered. Without this,
             // wait_for_response never sees a click and focus_pane never runs.
-            notification.action("default", "Open");
+            notification.action("default", FOCUS_ACTION_LABEL);
             // Stay until the user activates or dismisses. Do not use Critical
             // urgency: xfce4-notifyd keeps those on screen indefinitely, and a
             // short process-side TTL used to exit while the toast was still
@@ -749,6 +765,15 @@ mod tests {
             format_notification_body("scripts", "", "cursor", "cursor"),
             "scripts"
         );
+    }
+
+    #[test]
+    fn with_focus_hint_appends_discoverability_line() {
+        assert_eq!(
+            with_focus_hint("scripts · tech rev"),
+            format!("scripts · tech rev\n{FOCUS_HINT}")
+        );
+        assert_eq!(with_focus_hint(""), FOCUS_HINT);
     }
 
     #[test]

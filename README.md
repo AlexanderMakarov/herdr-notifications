@@ -59,13 +59,15 @@ plugin's binary is invoked once per event:
    Summary is `{agent} is done` / `{agent} needs you`; body is
    `workspace · tab` from `HERDR_PLUGIN_CONTEXT_JSON` (fallback: cwd
    basename from `herdr pane list`).
-4. If you click the notification (or the **Open** action on Linux notify
-   daemons that require one), the plugin runs `herdr agent focus
-   <pane_id>` to bring that pane back into view in herdr.
+4. If you click the notification body or **Open in Herdr**, the plugin runs
+   `herdr agent focus <pane_id>` to bring that pane back into view. The toast
+   body includes a short hint so body-click is discoverable on Linux.
 
 Herdr 0.8+ delivers `HERDR_PLUGIN_EVENT_JSON` as
 `{"event":"…","data":{…}}`; this plugin unwraps `data` and still accepts
-older bare payloads.
+older bare payloads (Herdr 0.7.x), so `min_herdr_version` stays `0.7.0`.
+Optional event fields (`agent`, `display_agent`, `title`, `workspace_id`)
+default when absent.
 
 ## Requirements
 
