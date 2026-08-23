@@ -73,14 +73,132 @@ enum EventData {
     #[serde(rename = "pane_agent_status_changed")]
     PaneAgentStatusChanged {
         pane_id: String,
+        #[serde(default)]
+        workspace_id: String,
+        #[serde(default)]
         agent: String,
         agent_status: String,
+        #[serde(default)]
         display_agent: String,
         #[serde(default)]
         title: String,
     },
     #[serde(other)]
     Other,
+}
+
+/// Subset of `HERDR_PLUGIN_CONTEXT_JSON` used to label notifications.
+#[derive(Debug, Deserialize, Default)]
+struct PluginContext {
+    #[serde(default)]
+    workspace_label: String,
+    #[serde(default)]
+    workspace_id: String,
+    #[serde(default)]
+    tab_label: String,
+    #[serde(default)]
+    focused_pane_id: String,
+}
+
+/// Herdr 0.8+ wraps plugin event JSON as `{"event":"...","data":{...}}`.
+/// Older / synthetic payloads may be the bare `data` object with a `type` tag.
+fn parse_event_payload(payload: &str) -> Result<EventData, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(payload).map_err(|e| e.to_string())?;
+    let body = value.get("data").cloned().unwrap_or(value);
+    serde_json::from_value(body).map_err(|e| e.to_string())
+}
+
+/// Build a human-readable location line: `workspace · tab`.
+fn format_location(workspace: &str, tab: &str) -> String {
+    match (workspace.is_empty(), tab.is_empty()) {
+        (false, false) => format!("{workspace} · {tab}"),
+        (false, true) => workspace.to_string(),
+        (true, false) => tab.to_string(),
+        (true, true) => String::new(),
+    }
+}
+
+/// Notification body: location, then optional agent title (skip redundant agent name).
+fn format_notification_body(workspace: &str, tab: &str, title: &str, agent: &str) -> String {
+    let location = format_location(workspace, tab);
+    let detail = if title.is_empty() || title == agent {
+        String::new()
+    } else {
+        title.to_string()
+    };
+    match (location.is_empty(), detail.is_empty()) {
+        (false, false) => format!("{location}\n{detail}"),
+        (false, true) => location,
+        (true, false) => detail,
+        (true, true) => {
+            if agent.is_empty() {
+                String::new()
+            } else {
+                agent.to_string()
+            }
+        }
+    }
+}
+
+/// Resolve workspace/tab labels for `pane_id`, preferring plugin context when it
+/// refers to that pane, otherwise `herdr pane list` cwd basename + tab id.
+fn resolve_location(pane_id: &str, workspace_id: &str) -> (String, String) {
+    if let Ok(raw) = env::var("HERDR_PLUGIN_CONTEXT_JSON") {
+        if let Ok(ctx) = serde_json::from_str::<PluginContext>(&raw) {
+            // Event hooks usually set context to the pane that changed.
+            if ctx.focused_pane_id.is_empty() || ctx.focused_pane_id == pane_id {
+                let workspace = if !ctx.workspace_label.is_empty() {
+                    ctx.workspace_label
+                } else if !ctx.workspace_id.is_empty() {
+                    ctx.workspace_id
+                } else {
+                    workspace_id.to_string()
+                };
+                return (workspace, ctx.tab_label);
+            }
+        }
+    }
+    if let Some((workspace, tab)) = lookup_pane_location(pane_id) {
+        return (workspace, tab);
+    }
+    (workspace_id.to_string(), String::new())
+}
+
+fn lookup_pane_location(pane_id: &str) -> Option<(String, String)> {
+    let bin = env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
+    let output = Command::new(&bin).args(["pane", "list"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    #[derive(Deserialize)]
+    struct PaneListEnvelope {
+        result: PaneListResult,
+    }
+    #[derive(Deserialize)]
+    struct PaneListResult {
+        panes: Vec<PaneRow>,
+    }
+    #[derive(Deserialize)]
+    struct PaneRow {
+        pane_id: String,
+        #[serde(default)]
+        cwd: String,
+        #[serde(default)]
+        tab_id: String,
+        #[serde(default)]
+        workspace_id: String,
+    }
+    let envelope: PaneListEnvelope = serde_json::from_slice(&output.stdout).ok()?;
+    let row = envelope.result.panes.into_iter().find(|p| p.pane_id == pane_id)?;
+    let workspace = Path::new(&row.cwd)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or(row.workspace_id);
+    let tab = row.tab_id;
+    Some((workspace, tab))
 }
 
 fn main() -> ExitCode {
@@ -112,7 +230,7 @@ fn run_event() -> Result<(), ()> {
         return Ok(());
     };
 
-    let data: EventData = match serde_json::from_str(&payload) {
+    let data: EventData = match parse_event_payload(&payload) {
         Ok(data) => data,
         Err(e) => {
             eprintln!("herdr-notifications: failed to parse event payload: {e}");
@@ -122,6 +240,7 @@ fn run_event() -> Result<(), ()> {
 
     let EventData::PaneAgentStatusChanged {
         pane_id,
+        workspace_id,
         agent,
         agent_status,
         display_agent,
@@ -132,12 +251,22 @@ fn run_event() -> Result<(), ()> {
         return Ok(());
     };
 
+    let display = if display_agent.is_empty() {
+        if agent.is_empty() {
+            "agent".to_string()
+        } else {
+            agent.clone()
+        }
+    } else {
+        display_agent
+    };
+
     // Record every status transition, not just the actionable ones, so a
     // "blocked -> working -> blocked" cycle is recognized as a fresh
     // "blocked" rather than being suppressed as a repeat of the first one.
     let changed = should_notify(&pane_id, &agent_status);
 
-    let Some((summary, sound)) = decide_notification(&agent_status, &display_agent) else {
+    let Some((summary, sound)) = decide_notification(&agent_status, &display) else {
         return Ok(()); // idle / working / unknown: not actionable, skip
     };
 
@@ -145,7 +274,8 @@ fn run_event() -> Result<(), ()> {
         return Ok(());
     }
 
-    let body = if title.is_empty() { agent } else { title };
+    let (workspace, tab) = resolve_location(&pane_id, &workspace_id);
+    let body = format_notification_body(&workspace, &tab, &title, &agent);
 
     send_notification(&summary, &body, sound, Some(&pane_id))
 }
@@ -224,6 +354,13 @@ fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Opti
             notification.sound_name(name);
         }
         if wants_click {
+            // XFCE (and most Linux notify daemons) only emit ActionInvoked on
+            // body-click when a "default" action is registered. Without this,
+            // wait_for_response never sees a click and focus_pane never runs.
+            notification.action("default", "Open");
+            // Critical keeps the toast around longer under xfce4-notifyd's
+            // short global expire-timeout (often 5s).
+            notification.urgency(notify_rust::Urgency::Critical);
             // Ignored on macOS (notify-rust has no manual-timeout support
             // there); CLICK_WAIT_TIMEOUT below bounds our own wait either way.
             notification.timeout(Timeout::Milliseconds(CLICK_WAIT_TIMEOUT.as_millis() as u32));
@@ -240,7 +377,20 @@ fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Opti
 
         if let Some(pane_id) = click_target {
             let _ = handle.wait_for_response(move |response: &NotificationResponse| {
-                let _ = click_tx.send(response.is_default_action().then_some(pane_id));
+                // Body click (Default) or any action button (e.g. "Open").
+                // xfce4-notifyd often closes on body-click with Dismissed and
+                // never emits ActionInvoked — treat that as focus too so Linux
+                // click-to-pane works. Explicit CloseAction (app-closed) does not.
+                let should_focus = matches!(
+                    response,
+                    NotificationResponse::Default
+                        | NotificationResponse::Action(_)
+                        | NotificationResponse::Closed(notify_rust::CloseReason::Dismissed)
+                );
+                if !should_focus {
+                    eprintln!("herdr-notifications: toast closed without action: {response:?}");
+                }
+                let _ = click_tx.send(should_focus.then_some(pane_id));
             });
         }
     });
@@ -544,6 +694,66 @@ mod tests {
     #[test]
     fn parse_notify_args_unknown_flag_errors() {
         assert!(parse_notify_args(vec!["--nope".into()]).is_err());
+    }
+
+    #[test]
+    fn parse_event_payload_unwraps_herdr_08_envelope() {
+        let raw = r#"{"event":"pane_agent_status_changed","data":{"type":"pane_agent_status_changed","pane_id":"w1:p9","workspace_id":"w1","agent_status":"blocked","agent":"claude"}}"#;
+        match parse_event_payload(raw).unwrap() {
+            EventData::PaneAgentStatusChanged {
+                pane_id,
+                workspace_id,
+                agent_status,
+                agent,
+                ..
+            } => {
+                assert_eq!(pane_id, "w1:p9");
+                assert_eq!(workspace_id, "w1");
+                assert_eq!(agent_status, "blocked");
+                assert_eq!(agent, "claude");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_event_payload_accepts_bare_data_object() {
+        let raw = r#"{"type":"pane_agent_status_changed","pane_id":"w1:p2","agent_status":"done","agent":"cursor"}"#;
+        match parse_event_payload(raw).unwrap() {
+            EventData::PaneAgentStatusChanged {
+                pane_id,
+                agent_status,
+                ..
+            } => {
+                assert_eq!(pane_id, "w1:p2");
+                assert_eq!(agent_status, "done");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_notification_body_includes_workspace_and_tab() {
+        assert_eq!(
+            format_notification_body("scripts", "tech rev", "", "cursor"),
+            "scripts · tech rev"
+        );
+        assert_eq!(
+            format_notification_body("scripts", "tech rev", "Build finished", "cursor"),
+            "scripts · tech rev\nBuild finished"
+        );
+        assert_eq!(
+            format_notification_body("scripts", "", "cursor", "cursor"),
+            "scripts"
+        );
+    }
+
+    #[test]
+    fn format_location_joins_nonempty_parts() {
+        assert_eq!(format_location("ws", "tab"), "ws · tab");
+        assert_eq!(format_location("ws", ""), "ws");
+        assert_eq!(format_location("", "tab"), "tab");
+        assert_eq!(format_location("", ""), "");
     }
 
     #[test]

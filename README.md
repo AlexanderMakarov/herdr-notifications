@@ -14,6 +14,9 @@ terminal.
   again, since it's not a repeat.
 - **Click to focus**: clicking a status-change notification focuses the
   originating pane back in herdr.
+- **Location in the toast**: body shows `workspace · tab` (and the agent
+  title when present) so you can tell which project fired, not only which
+  agent binary.
 - **Zero runtime config required**: works out of the box; the dedup state
   lives under herdr's own per-plugin state directory (or a per-user local
   data directory as a fallback), never a shared/world-writable location.
@@ -53,8 +56,16 @@ plugin's binary is invoked once per event:
    correctly recognized as new) but never notify on their own.
 3. The notification is shown on a background thread with a bounded wait, so
    a stuck notification daemon can never hang the process indefinitely.
-4. If you click the notification, the plugin runs `herdr agent focus
+   Summary is `{agent} is done` / `{agent} needs you`; body is
+   `workspace · tab` from `HERDR_PLUGIN_CONTEXT_JSON` (fallback: cwd
+   basename from `herdr pane list`).
+4. If you click the notification (or the **Open** action on Linux notify
+   daemons that require one), the plugin runs `herdr agent focus
    <pane_id>` to bring that pane back into view in herdr.
+
+Herdr 0.8+ delivers `HERDR_PLUGIN_EVENT_JSON` as
+`{"event":"…","data":{…}}`; this plugin unwraps `data` and still accepts
+older bare payloads.
 
 ## Requirements
 
