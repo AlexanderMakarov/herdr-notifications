@@ -26,11 +26,11 @@ use serde::Deserialize;
 /// initial show request before giving up on it.
 const SHOW_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long to wait for a click after the notification is shown, when
-/// there's a pane to focus on click. Also requested as the notification's
-/// own on-screen lifetime (macOS ignores that request, so this bound is
-/// enforced ourselves either way — see `send_notification`).
-const CLICK_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Safety only: if the notification daemon never emits ActionInvoked /
+/// NotificationClosed (hung D-Bus), exit eventually. The process must stay
+/// alive for as long as the toast is on screen — a short TTL left visible
+/// toasts with no click listener.
+const CLICK_WAIT_SAFETY_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Sound {
@@ -330,9 +330,9 @@ fn parse_notify_args(args: Vec<String>) -> Result<(String, String, Sound), Strin
 
 /// Shows the notification on a background thread so a hung notification
 /// daemon (stale D-Bus session, unresponsive systemd-user restart) can't
-/// block this process forever. When `click_target` is a pane id, also waits
-/// (bounded by `CLICK_WAIT_TIMEOUT`) for the user to click the notification
-/// body and, if they do, focuses that pane in herdr.
+/// block the initial show forever. When `click_target` is a pane id, the
+/// process stays alive until the toast is activated or closed (with a long
+/// safety timeout), so a visible toast always has a click listener.
 fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Option<&str>) -> Result<(), ()> {
     let summary = summary.to_string();
     let body = body.to_string();
@@ -358,12 +358,11 @@ fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Opti
             // body-click when a "default" action is registered. Without this,
             // wait_for_response never sees a click and focus_pane never runs.
             notification.action("default", "Open");
-            // Critical keeps the toast around longer under xfce4-notifyd's
-            // short global expire-timeout (often 5s).
-            notification.urgency(notify_rust::Urgency::Critical);
-            // Ignored on macOS (notify-rust has no manual-timeout support
-            // there); CLICK_WAIT_TIMEOUT below bounds our own wait either way.
-            notification.timeout(Timeout::Milliseconds(CLICK_WAIT_TIMEOUT.as_millis() as u32));
+            // Stay until the user activates or dismisses. Do not use Critical
+            // urgency: xfce4-notifyd keeps those on screen indefinitely, and a
+            // short process-side TTL used to exit while the toast was still
+            // visible — clicks then did nothing.
+            notification.timeout(Timeout::Never);
         }
 
         let handle = match notification.show() {
@@ -409,11 +408,16 @@ fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Opti
     };
 
     if wants_click && shown.is_ok() {
-        // Bounded independently of the platform backend's own timeout
-        // support: if nothing arrives in time we just return, and the
-        // still-blocked background thread (if any) dies with the process.
-        if let Ok(Some(pane_id)) = click_rx.recv_timeout(CLICK_WAIT_TIMEOUT) {
-            focus_pane(&pane_id);
+        // Block until the daemon reports activation or close — same lifetime
+        // as the on-screen toast. Safety timeout only for a hung daemon.
+        match click_rx.recv_timeout(CLICK_WAIT_SAFETY_TIMEOUT) {
+            Ok(Some(pane_id)) => focus_pane(&pane_id),
+            Ok(None) => {}
+            Err(_) => {
+                eprintln!(
+                    "herdr-notifications: no ActionInvoked/NotificationClosed within {CLICK_WAIT_SAFETY_TIMEOUT:?}; giving up"
+                );
+            }
         }
     }
 
