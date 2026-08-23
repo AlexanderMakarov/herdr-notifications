@@ -26,17 +26,19 @@ use serde::Deserialize;
 /// initial show request before giving up on it.
 const SHOW_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long a clickable toast stays on screen / how long we listen for
-/// ActionInvoked. Must match: a shorter process wait left zombie bubbles;
-/// Timeout::Never left permanent toasts that can steal pointer clicks.
-const TOAST_LIFETIME: Duration = Duration::from_secs(60);
+/// Safety only when the toast uses no expire (`Timeout::Never`): hung D-Bus.
+const CLICK_WAIT_SAFETY_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
-/// Freedesktop default-action button label (Linux). Body click maps to the
-/// same default action on daemons that support it.
+/// Ignore NotificationClosed for this long after show so XFCE replace/show
+/// churn cannot be mistaken for a user click.
+const POST_SHOW_LISTEN_GRACE: Duration = Duration::from_millis(750);
+
+/// Freedesktop default-action button label (Linux).
 const FOCUS_ACTION_LABEL: &str = "Open in Herdr";
 
-/// Shown under the location line so body-click is discoverable, not only the button.
-const FOCUS_HINT: &str = "Click notification or “Open in Herdr” to jump there.";
+/// Shown under the location line. On XFCE, body click dismisses without
+/// ActionInvoked — we treat that dismiss as focus after the post-show grace.
+const FOCUS_HINT: &str = "Click this notification (or “Open in Herdr”) to jump there.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Sound {
@@ -346,8 +348,7 @@ fn parse_notify_args(args: Vec<String>) -> Result<(String, String, Sound), Strin
 /// Shows the notification on a background thread so a hung notification
 /// daemon (stale D-Bus session, unresponsive systemd-user restart) can't
 /// block the initial show forever. When `click_target` is a pane id, the
-/// process stays alive for about `TOAST_LIFETIME` so a visible toast still
-/// has a click listener (matched timeout; no permanent Critical bubbles).
+/// process stays alive until the toast is activated or dismissed.
 fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Option<&str>) -> Result<(), ()> {
     let summary = summary.to_string();
     let body = body.to_string();
@@ -369,14 +370,11 @@ fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Opti
             notification.sound_name(name);
         }
         if wants_click {
-            // XFCE (and most Linux notify daemons) only emit ActionInvoked on
-            // body-click when a "default" action is registered. Without this,
-            // wait_for_response never sees a click and focus_pane never runs.
             notification.action("default", FOCUS_ACTION_LABEL);
-            // Match on-screen lifetime to the click listener. Avoid Critical +
-            // Never: XFCE keeps those indefinitely and stacked bubbles can
-            // intercept pointer clicks / feel like "sporadic" input glitches.
-            notification.timeout(Timeout::Milliseconds(TOAST_LIFETIME.as_millis() as u32));
+            // Stay until the user clicks/dismisses. Normal urgency (not Critical)
+            // so stacked toasts do not steal the pointer. XFCE honors Never;
+            // a short expire left almost no time to click.
+            notification.timeout(Timeout::Never);
             notification.urgency(notify_rust::Urgency::Normal);
         }
 
@@ -390,15 +388,16 @@ fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Opti
         let _ = shown_tx.send(Ok(()));
 
         if let Some(pane_id) = click_target {
+            // Skip XFCE show/replace signal noise before we attach the waiter.
+            std::thread::sleep(POST_SHOW_LISTEN_GRACE);
             let _ = handle.wait_for_response(move |response: &NotificationResponse| {
-                // Only real activations — never NotificationClosed.
-                // xfce4-notifyd (and replaces) can emit Closed(Dismissed)
-                // when the toast is first shown; treating that as a click
-                // focused the pane immediately and exited the wait, so a
-                // later real click had no listener left.
+                // XFCE: body click → NotificationClosed(Dismissed) only (no
+                // ActionInvoked). Button → Default/Action. Auto-expire → Expired.
                 let should_focus = matches!(
                     response,
-                    NotificationResponse::Default | NotificationResponse::Action(_)
+                    NotificationResponse::Default
+                        | NotificationResponse::Action(_)
+                        | NotificationResponse::Closed(notify_rust::CloseReason::Dismissed)
                 );
                 if !should_focus {
                     eprintln!("herdr-notifications: toast closed without action: {response:?}");
@@ -423,13 +422,14 @@ fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Opti
     };
 
     if wants_click && shown.is_ok() {
-        // Listen for the same duration the toast is requested to stay up, plus
-        // a small grace for NotificationClosed after expiry.
-        let wait = TOAST_LIFETIME + Duration::from_secs(5);
-        match click_rx.recv_timeout(wait) {
+        match click_rx.recv_timeout(CLICK_WAIT_SAFETY_TIMEOUT) {
             Ok(Some(pane_id)) => focus_pane(&pane_id),
             Ok(None) => {}
-            Err(_) => {}
+            Err(_) => {
+                eprintln!(
+                    "herdr-notifications: no click/dismiss within {CLICK_WAIT_SAFETY_TIMEOUT:?}; giving up"
+                );
+            }
         }
     }
 
