@@ -377,15 +377,14 @@ fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Opti
 
         if let Some(pane_id) = click_target {
             let _ = handle.wait_for_response(move |response: &NotificationResponse| {
-                // Body click (Default) or any action button (e.g. "Open").
-                // xfce4-notifyd often closes on body-click with Dismissed and
-                // never emits ActionInvoked — treat that as focus too so Linux
-                // click-to-pane works. Explicit CloseAction (app-closed) does not.
+                // Only real activations — never NotificationClosed.
+                // xfce4-notifyd (and replaces) can emit Closed(Dismissed)
+                // when the toast is first shown; treating that as a click
+                // focused the pane immediately and exited the wait, so a
+                // later real click had no listener left.
                 let should_focus = matches!(
                     response,
-                    NotificationResponse::Default
-                        | NotificationResponse::Action(_)
-                        | NotificationResponse::Closed(notify_rust::CloseReason::Dismissed)
+                    NotificationResponse::Default | NotificationResponse::Action(_)
                 );
                 if !should_focus {
                     eprintln!("herdr-notifications: toast closed without action: {response:?}");
