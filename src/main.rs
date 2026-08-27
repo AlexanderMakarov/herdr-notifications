@@ -440,6 +440,10 @@ fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Opti
 /// focus in herdr when the user clicks it. Uses the `herdr` binary herdr
 /// hands every plugin process via $HERDR_BIN_PATH (falling back to `herdr`
 /// on PATH) rather than talking to the socket API directly.
+///
+/// On Linux, also raises the OS window that hosts the Herdr UI client so a
+/// click from another app actually brings the terminal to the foreground
+/// (`herdr agent focus` only switches the pane inside Herdr).
 fn focus_pane(pane_id: &str) {
     let bin = env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
     match Command::new(&bin).args(["agent", "focus", pane_id]).output() {
@@ -453,6 +457,181 @@ fn focus_pane(pane_id: &str) {
             eprintln!("herdr-notifications: failed to run '{bin}' to focus pane {pane_id}: {e}");
         }
         _ => {}
+    }
+    raise_herdr_host_window();
+}
+
+/// True when `argv` looks like a long-lived Herdr UI client (`herdr`,
+/// `herdr --session …`), not `herdr server` or short CLI helpers like
+/// `herdr agent focus`.
+fn is_herdr_ui_client_argv(argv: &[String]) -> bool {
+    let Some(bin) = argv.first() else {
+        return false;
+    };
+    let Some(name) = Path::new(bin).file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    if name != "herdr" {
+        return false;
+    }
+    match argv.get(1).map(String::as_str) {
+        None => true,
+        Some(arg) if arg.starts_with('-') => true,
+        Some(_) => false,
+    }
+}
+
+/// Walk each client PID's parent chain and return the first window id a
+/// lookup finds. Pure so unit tests can inject parent/window maps.
+fn pick_host_window_id(
+    client_pids: &[u32],
+    parent_of: impl Fn(u32) -> Option<u32>,
+    window_for: impl Fn(u32) -> Option<String>,
+) -> Option<String> {
+    for &start in client_pids {
+        let mut pid = start;
+        // Cap depth so a corrupt parent loop cannot hang the plugin.
+        for _ in 0..64 {
+            if let Some(wid) = window_for(pid) {
+                return Some(wid);
+            }
+            match parent_of(pid) {
+                Some(parent) if parent > 1 && parent != pid => pid = parent,
+                _ => break,
+            }
+        }
+    }
+    None
+}
+
+/// Best-effort: activate the terminal/GUI window that owns a Herdr UI client.
+/// No-op when not on Linux or when no host window can be found.
+fn raise_herdr_host_window() {
+    #[cfg(target_os = "linux")]
+    {
+        let clients = linux_herdr_ui_client_pids();
+        if clients.is_empty() {
+            return;
+        }
+        let Some(wid) = pick_host_window_id(
+            &clients,
+            linux_parent_pid,
+            linux_window_id_for_pid,
+        ) else {
+            eprintln!(
+                "herdr-notifications: focused pane but could not find a host window to raise"
+            );
+            return;
+        };
+        if let Err(e) = linux_activate_window(&wid) {
+            eprintln!("herdr-notifications: failed to raise host window {wid}: {e}");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_herdr_ui_client_pids() -> Vec<u32> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut pids = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid_str) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        let cmdline_path = entry.path().join("cmdline");
+        let Ok(bytes) = fs::read(&cmdline_path) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        let argv: Vec<String> = bytes
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        if is_herdr_ui_client_argv(&argv) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+#[cfg(target_os = "linux")]
+fn linux_parent_pid(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `/proc/pid/stat`: pid (comm) state ppid ... — comm may contain spaces/parens,
+    // so take the field after the last ')' then skip state.
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_window_id_for_pid(pid: u32) -> Option<String> {
+    let output = Command::new("xdotool")
+        .args(["search", "--pid", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let wid = stdout.lines().next()?.trim();
+    if wid.is_empty() {
+        None
+    } else {
+        Some(wid.to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_activate_window(wid: &str) -> Result<(), String> {
+    // Prefer wmctrl (handles desktop switch + raise well on XFCE); fall back
+    // to xdotool. Accept decimal or 0x-hex ids from xdotool/wmctrl.
+    let hex = if let Some(stripped) = wid.strip_prefix("0x").or_else(|| wid.strip_prefix("0X")) {
+        format!("0x{stripped}")
+    } else if let Ok(n) = wid.parse::<u64>() {
+        format!("0x{n:x}")
+    } else {
+        wid.to_string()
+    };
+
+    let wmctrl = Command::new("wmctrl").args(["-ia", &hex]).output();
+    match wmctrl {
+        Ok(out) if out.status.success() => return Ok(()),
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            // Fall through to xdotool.
+            let xd = Command::new("xdotool")
+                .args(["windowactivate", "--sync", wid])
+                .output()
+                .map_err(|e| e.to_string())?;
+            if xd.status.success() {
+                Ok(())
+            } else {
+                Err(if err.is_empty() {
+                    String::from_utf8_lossy(&xd.stderr).trim().to_string()
+                } else {
+                    err
+                })
+            }
+        }
+        Err(_) => {
+            let xd = Command::new("xdotool")
+                .args(["windowactivate", "--sync", wid])
+                .output()
+                .map_err(|e| e.to_string())?;
+            if xd.status.success() {
+                Ok(())
+            } else {
+                Err(String::from_utf8_lossy(&xd.stderr).trim().to_string())
+            }
+        }
     }
 }
 
@@ -770,6 +949,66 @@ mod tests {
             format!("scripts · tech rev\n{FOCUS_HINT}")
         );
         assert_eq!(with_focus_hint(""), FOCUS_HINT);
+    }
+
+    #[test]
+    fn is_herdr_ui_client_argv_accepts_bare_and_flag_launches() {
+        assert!(is_herdr_ui_client_argv(&["herdr".into()]));
+        assert!(is_herdr_ui_client_argv(&[
+            "/home/u/.local/bin/herdr".into()
+        ]));
+        assert!(is_herdr_ui_client_argv(&[
+            "herdr".into(),
+            "--session".into(),
+            "main".into()
+        ]));
+    }
+
+    #[test]
+    fn is_herdr_ui_client_argv_rejects_server_and_cli_subcommands() {
+        assert!(!is_herdr_ui_client_argv(&[
+            "herdr".into(),
+            "server".into()
+        ]));
+        assert!(!is_herdr_ui_client_argv(&[
+            "/home/u/.local/bin/herdr".into(),
+            "server".into()
+        ]));
+        assert!(!is_herdr_ui_client_argv(&[
+            "herdr".into(),
+            "agent".into(),
+            "focus".into(),
+            "w1:p1".into()
+        ]));
+        assert!(!is_herdr_ui_client_argv(&[
+            "herdr".into(),
+            "pane".into(),
+            "list".into()
+        ]));
+        assert!(!is_herdr_ui_client_argv(&["bash".into()]));
+        assert!(!is_herdr_ui_client_argv(&[]));
+    }
+
+    #[test]
+    fn pick_host_window_id_walks_client_ancestors() {
+        // client 100 → bash 50 → wezterm 10 (has window); unrelated 200 → 99 (no window)
+        let parent = |pid: u32| match pid {
+            100 => Some(50),
+            50 => Some(10),
+            10 => Some(1),
+            200 => Some(99),
+            99 => Some(1),
+            _ => None,
+        };
+        let window_for = |pid: u32| match pid {
+            10 => Some("0xabc".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            pick_host_window_id(&[100, 200], parent, window_for).as_deref(),
+            Some("0xabc")
+        );
+        assert_eq!(pick_host_window_id(&[200], parent, window_for), None);
     }
 
     #[test]

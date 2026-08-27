@@ -13,7 +13,8 @@ terminal.
   re-notifies — but a `blocked → working → blocked` cycle correctly notifies
   again, since it's not a repeat.
 - **Click to focus**: clicking a status-change notification focuses the
-  originating pane back in herdr.
+  originating pane in herdr and, on Linux, raises the terminal window that
+  hosts the Herdr UI (so a click from another app brings WezTerm/etc. forward).
 - **Location in the toast**: body shows `workspace · tab` (and the agent
   title when present) so you can tell which project fired, not only which
   agent binary.
@@ -60,8 +61,10 @@ plugin's binary is invoked once per event:
    `workspace · tab` from `HERDR_PLUGIN_CONTEXT_JSON` (fallback: cwd
    basename from `herdr pane list`).
 4. If you click the notification body or **Open in Herdr**, the plugin runs
-   `herdr agent focus <pane_id>` to bring that pane back into view. The toast
-   body includes a short hint so body-click is discoverable on Linux.
+   `herdr agent focus <pane_id>` to bring that pane back into view, then on
+   Linux best-effort raises the OS window that owns the Herdr UI client
+   (`xdotool`/`wmctrl`). The toast body includes a short hint so body-click
+   is discoverable on Linux.
 
 Herdr 0.8+ delivers `HERDR_PLUGIN_EVENT_JSON` as
 `{"event":"…","data":{…}}`; this plugin unwraps `data` and still accepts
