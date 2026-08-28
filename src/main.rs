@@ -17,28 +17,43 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use notify_rust::{Notification, NotificationResponse, Timeout};
+#[cfg(all(unix, not(target_os = "macos")))]
+use notify_rust::ActionResponse;
+use notify_rust::{CloseReason, Notification, NotificationResponse, ResponseHandler, Timeout};
 use serde::Deserialize;
 
 /// How long to wait for the notification backend to acknowledge the
 /// initial show request before giving up on it.
 const SHOW_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Safety only when the toast uses no expire (`Timeout::Never`): hung D-Bus.
-const CLICK_WAIT_SAFETY_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+/// How long an actionable toast stays on screen, and so how long this process
+/// lives waiting for a click. Bounded on purpose: several agents going
+/// `blocked` at once must not leave several plugin processes and D-Bus
+/// connections parked until somebody gets around to clicking.
+const TOAST_LIFETIME: Duration = Duration::from_secs(60);
 
-/// Ignore NotificationClosed for this long after show so XFCE replace/show
-/// churn cannot be mistaken for a user click.
+/// Safety net over [`TOAST_LIFETIME`] for a daemon that never reports the
+/// expiry (hung D-Bus, no `NotificationClosed(Expired)`).
+const CLICK_WAIT_SAFETY_TIMEOUT: Duration = Duration::from_secs(65);
+
+/// A `Dismissed` this soon after show is XFCE show/replace churn, not a user
+/// click. We stay subscribed through it rather than sleeping past it.
 const POST_SHOW_LISTEN_GRACE: Duration = Duration::from_millis(750);
 
-/// Freedesktop default-action button label (Linux).
-const FOCUS_ACTION_LABEL: &str = "Open in Herdr";
+/// Cap on re-subscribes after churn, so a daemon emitting a signal storm
+/// cannot spin this thread.
+const MAX_LISTEN_REARMS: u32 = 3;
 
-/// Shown under the location line. On XFCE, body click dismisses without
-/// ActionInvoked — we treat that dismiss as focus after the post-show grace.
-const FOCUS_HINT: &str = "Click this notification (or “Open in Herdr”) to jump there.";
+/// Forces the [`ClickOutcome::Focus`]-on-`Dismissed` rule on (`1`) or off
+/// (`0`), for daemons other than XFCE that share the behaviour.
+const CLICK_ON_DISMISS_ENV: &str = "HERDR_NOTIFICATIONS_CLICK_ON_DISMISS";
+
+/// Freedesktop default-action button label. Only rendered on XDG: `action()`
+/// is inert on the default macOS backend, so no hint text promises a button
+/// that isn't there.
+const FOCUS_ACTION_LABEL: &str = "Open in Herdr";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Sound {
@@ -75,6 +90,11 @@ impl Sound {
     }
 }
 
+/// Fields herdr types as `["string", "null"]` are `Option<String>`, not
+/// `#[serde(default)] String`: `default` only covers a *missing* key, so an
+/// explicit `"title": null` would fail with `invalid type: null, expected a
+/// string`. `agent_status` stays a `String` rather than mirroring herdr's
+/// closed `AgentStatus` enum so a future status is ignored, not a parse error.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 enum EventData {
@@ -84,12 +104,12 @@ enum EventData {
         #[serde(default)]
         workspace_id: String,
         #[serde(default)]
-        agent: String,
+        agent: Option<String>,
         agent_status: String,
         #[serde(default)]
-        display_agent: String,
+        display_agent: Option<String>,
         #[serde(default)]
-        title: String,
+        title: Option<String>,
     },
     #[serde(other)]
     Other,
@@ -117,19 +137,19 @@ fn parse_event_payload(payload: &str) -> Result<EventData, String> {
     serde_json::from_value(body).map_err(|e| e.to_string())
 }
 
-/// Build a human-readable location line: `workspace · tab`.
-fn format_location(workspace: &str, tab: &str) -> String {
-    match (workspace.is_empty(), tab.is_empty()) {
-        (false, false) => format!("{workspace} · {tab}"),
-        (false, true) => workspace.to_string(),
-        (true, false) => tab.to_string(),
+/// Join the two location labels into one line: `primary · secondary`.
+fn format_location(primary: &str, secondary: &str) -> String {
+    match (primary.is_empty(), secondary.is_empty()) {
+        (false, false) => format!("{primary} · {secondary}"),
+        (false, true) => primary.to_string(),
+        (true, false) => secondary.to_string(),
         (true, true) => String::new(),
     }
 }
 
 /// Notification body: location, then optional agent title (skip redundant agent name).
-fn format_notification_body(workspace: &str, tab: &str, title: &str, agent: &str) -> String {
-    let location = format_location(workspace, tab);
+fn format_notification_body(primary: &str, secondary: &str, title: &str, agent: &str) -> String {
+    let location = format_location(primary, secondary);
     let detail = if title.is_empty() || title == agent {
         String::new()
     } else {
@@ -149,40 +169,37 @@ fn format_notification_body(workspace: &str, tab: &str, title: &str, agent: &str
     }
 }
 
-/// Append the focus hint used on clickable (event) toasts.
-fn with_focus_hint(body: &str) -> String {
-    if body.is_empty() {
-        FOCUS_HINT.to_string()
-    } else {
-        format!("{body}\n{FOCUS_HINT}")
-    }
-}
-
-/// Resolve workspace/tab labels for `pane_id`, preferring plugin context when it
-/// refers to that pane, otherwise `herdr pane list` cwd basename + tab id.
-fn resolve_location(pane_id: &str, workspace_id: &str) -> (String, String) {
+/// Resolve the two display labels for `pane_id`, as `(primary, secondary)`.
+///
+/// Deliberately *not* named workspace/tab: only the `HERDR_PLUGIN_CONTEXT_JSON`
+/// path yields a genuine workspace label and tab label. The `herdr pane list`
+/// fallback substitutes the pane's cwd basename and tab id, which read better
+/// in a toast (`herdr-notifications` beats `w1`) but are not workspace labels.
+fn resolve_location_labels(pane_id: &str, workspace_id: &str) -> (String, String) {
     if let Ok(raw) = env::var("HERDR_PLUGIN_CONTEXT_JSON") {
         if let Ok(ctx) = serde_json::from_str::<PluginContext>(&raw) {
             // Event hooks usually set context to the pane that changed.
             if ctx.focused_pane_id.is_empty() || ctx.focused_pane_id == pane_id {
-                let workspace = if !ctx.workspace_label.is_empty() {
+                let primary = if !ctx.workspace_label.is_empty() {
                     ctx.workspace_label
                 } else if !ctx.workspace_id.is_empty() {
                     ctx.workspace_id
                 } else {
                     workspace_id.to_string()
                 };
-                return (workspace, ctx.tab_label);
+                return (primary, ctx.tab_label);
             }
         }
     }
-    if let Some((workspace, tab)) = lookup_pane_location(pane_id) {
-        return (workspace, tab);
+    if let Some(labels) = lookup_pane_labels(pane_id) {
+        return labels;
     }
     (workspace_id.to_string(), String::new())
 }
 
-fn lookup_pane_location(pane_id: &str) -> Option<(String, String)> {
+/// `(cwd basename or workspace id, tab id)` for `pane_id` from `herdr pane list`.
+/// See [`resolve_location_labels`] for why these are labels, not a workspace/tab pair.
+fn lookup_pane_labels(pane_id: &str) -> Option<(String, String)> {
     let bin = env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
     let output = Command::new(&bin).args(["pane", "list"]).output().ok()?;
     if !output.status.success() {
@@ -208,14 +225,13 @@ fn lookup_pane_location(pane_id: &str) -> Option<(String, String)> {
     }
     let envelope: PaneListEnvelope = serde_json::from_slice(&output.stdout).ok()?;
     let row = envelope.result.panes.into_iter().find(|p| p.pane_id == pane_id)?;
-    let workspace = Path::new(&row.cwd)
+    let primary = Path::new(&row.cwd)
         .file_name()
         .and_then(|s| s.to_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .unwrap_or(row.workspace_id);
-    let tab = row.tab_id;
-    Some((workspace, tab))
+    Some((primary, row.tab_id))
 }
 
 fn main() -> ExitCode {
@@ -268,15 +284,7 @@ fn run_event() -> Result<(), ()> {
         return Ok(());
     };
 
-    let display = if display_agent.is_empty() {
-        if agent.is_empty() {
-            "agent".to_string()
-        } else {
-            agent.clone()
-        }
-    } else {
-        display_agent
-    };
+    let display = display_agent_name(display_agent.as_deref(), agent.as_deref());
 
     // Record every status transition, not just the actionable ones, so a
     // "blocked -> working -> blocked" cycle is recognized as a fresh
@@ -291,10 +299,28 @@ fn run_event() -> Result<(), ()> {
         return Ok(());
     }
 
-    let (workspace, tab) = resolve_location(&pane_id, &workspace_id);
-    let body = with_focus_hint(&format_notification_body(&workspace, &tab, &title, &agent));
+    let (primary, secondary) = resolve_location_labels(&pane_id, &workspace_id);
+    let body = format_notification_body(
+        &primary,
+        &secondary,
+        title.as_deref().unwrap_or_default(),
+        agent.as_deref().unwrap_or_default(),
+    );
 
     send_notification(&summary, &body, sound, Some(&pane_id))
+}
+
+/// Fallback chain for the name shown in the summary: the agent's display name,
+/// then its raw id, then a generic label. Treats `null` and `""` alike — herdr
+/// types these fields as nullable but can also send an empty string.
+fn display_agent_name(display_agent: Option<&str>, agent: Option<&str>) -> String {
+    [display_agent, agent]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|candidate| !candidate.is_empty())
+        .unwrap_or("agent")
+        .to_string()
 }
 
 /// Pure decision: which `agent_status` values are worth surfacing, and what
@@ -371,11 +397,10 @@ fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Opti
         }
         if wants_click {
             notification.action("default", FOCUS_ACTION_LABEL);
-            // Stay until the user clicks/dismisses. Normal urgency (not Critical)
-            // so stacked toasts do not steal the pointer. XFCE honors Never;
-            // a short expire left almost no time to click.
-            notification.timeout(Timeout::Never);
-            notification.urgency(notify_rust::Urgency::Normal);
+            // Leave urgency alone: Normal is already the XDG default, and
+            // `urgency()` does not exist on the default macOS backend
+            // (notify-rust gates it behind the `preview-macos-un` feature).
+            notification.timeout(Timeout::Milliseconds(TOAST_LIFETIME.as_millis() as u32));
         }
 
         let handle = match notification.show() {
@@ -385,25 +410,12 @@ fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Opti
                 return;
             }
         };
+        let shown_at = Instant::now();
         let _ = shown_tx.send(Ok(()));
 
         if let Some(pane_id) = click_target {
-            // Skip XFCE show/replace signal noise before we attach the waiter.
-            std::thread::sleep(POST_SHOW_LISTEN_GRACE);
-            let _ = handle.wait_for_response(move |response: &NotificationResponse| {
-                // XFCE: body click → NotificationClosed(Dismissed) only (no
-                // ActionInvoked). Button → Default/Action. Auto-expire → Expired.
-                let should_focus = matches!(
-                    response,
-                    NotificationResponse::Default
-                        | NotificationResponse::Action(_)
-                        | NotificationResponse::Closed(notify_rust::CloseReason::Dismissed)
-                );
-                if !should_focus {
-                    eprintln!("herdr-notifications: toast closed without action: {response:?}");
-                }
-                let _ = click_tx.send(should_focus.then_some(pane_id));
-            });
+            let focused = wait_for_focus_click(handle, shown_at, dismiss_counts_as_click());
+            let _ = click_tx.send(focused.then_some(pane_id));
         }
     });
 
@@ -434,6 +446,177 @@ fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Opti
     }
 
     shown
+}
+
+/// What to do with one response from the notification daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClickOutcome {
+    /// The user activated the toast: focus the pane.
+    Focus,
+    /// Daemon churn, not a user action: stay subscribed and keep waiting.
+    Rearm,
+    /// The toast is finished (expired, closed by the daemon, closed by API).
+    Stop,
+}
+
+/// Pure classifier for a daemon response, so the rules are testable without
+/// a session bus.
+///
+/// `Dismissed` means "the notification went away", *not* "the user clicked
+/// it" — on GNOME/KDE/dunst/mako, and on Windows and macOS, the ✕ button and
+/// a swipe both produce it. xfce4-notifyd is the exception: a body click
+/// there emits only `NotificationClosed(Dismissed)` and never `ActionInvoked`,
+/// so `dismiss_is_click` turns that reading on just for daemons that need it.
+///
+/// xfce4-notifyd also emits `Dismissed` as show/replace churn immediately
+/// after `show()`, hence the grace window.
+fn classify_response(
+    response: &NotificationResponse,
+    dismiss_is_click: bool,
+    since_show: Duration,
+) -> ClickOutcome {
+    match response {
+        NotificationResponse::Default | NotificationResponse::Action(_) => ClickOutcome::Focus,
+        NotificationResponse::Closed(CloseReason::Dismissed) if dismiss_is_click => {
+            if since_show >= POST_SHOW_LISTEN_GRACE {
+                ClickOutcome::Focus
+            } else {
+                ClickOutcome::Rearm
+            }
+        }
+        _ => ClickOutcome::Stop,
+    }
+}
+
+/// Whether this notification daemon reports a body click only as
+/// `NotificationClosed(Dismissed)`.
+///
+/// True for xfce4-notifyd, which identifies itself as `Xfce Notify Daemon`
+/// (vendor `Xfce`) — not as its package name. Capabilities cannot be used to
+/// detect this: XFCE advertises `actions` and then never emits `ActionInvoked`
+/// for a body click.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn dismiss_counts_as_click() -> bool {
+    match env::var(CLICK_ON_DISMISS_ENV).as_deref() {
+        Ok("1") => return true,
+        Ok("0") => return false,
+        _ => {}
+    }
+    match notify_rust::get_server_information() {
+        Ok(info) => server_is_xfce(&info.name, &info.vendor),
+        Err(e) => {
+            eprintln!("herdr-notifications: could not identify notification server: {e}");
+            false
+        }
+    }
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn dismiss_counts_as_click() -> bool {
+    matches!(env::var(CLICK_ON_DISMISS_ENV).as_deref(), Ok("1"))
+}
+
+/// Pure half of [`dismiss_counts_as_click`], matched on the strings
+/// `GetServerInformation` actually returns.
+fn server_is_xfce(name: &str, vendor: &str) -> bool {
+    name.to_ascii_lowercase().contains("xfce") || vendor.to_ascii_lowercase().contains("xfce")
+}
+
+/// Wait for the user to activate the toast, returning whether to focus.
+///
+/// Subscribes immediately — notify-rust registers its `ActionInvoked` /
+/// `NotificationClosed` match rules *inside* the wait call, so any sleep
+/// before this point is a window in which signals are never delivered at all,
+/// not merely filtered.
+///
+/// A response classified [`ClickOutcome::Rearm`] re-subscribes rather than
+/// returning, because the underlying wait loop breaks after the first matching
+/// signal whatever the handler decides — ignoring churn in the handler alone
+/// would leave the toast on screen with nothing listening to it.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn wait_for_focus_click(
+    handle: notify_rust::NotificationHandle,
+    shown_at: Instant,
+    dismiss_is_click: bool,
+) -> bool {
+    let id = handle.id();
+    let mut outcome = capture_outcome(shown_at, dismiss_is_click, |handler| {
+        let _ = handle.wait_for_response(handler);
+    });
+
+    for _ in 0..MAX_LISTEN_REARMS {
+        match outcome {
+            ClickOutcome::Focus => return true,
+            ClickOutcome::Stop => return false,
+            ClickOutcome::Rearm => {
+                outcome = capture_outcome(shown_at, dismiss_is_click, |handler| {
+                    let _ = notify_rust::handle_action(id, |response: &ActionResponse<'_>| {
+                        handler.call(&normalize_action_response(response));
+                    });
+                });
+            }
+        }
+    }
+    outcome == ClickOutcome::Focus
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn wait_for_focus_click(
+    handle: notify_rust::NotificationHandle,
+    shown_at: Instant,
+    dismiss_is_click: bool,
+) -> bool {
+    // No re-arm path off XDG: `Dismissed` is never a click on these backends,
+    // so nothing is ever classified `Rearm`.
+    capture_outcome(shown_at, dismiss_is_click, |handler| {
+        let _ = handle.wait_for_response(handler);
+    }) == ClickOutcome::Focus
+}
+
+/// Runs one blocking wait and reports how its response was classified.
+/// `Stop` when the wait returns without ever invoking the handler.
+fn capture_outcome(
+    shown_at: Instant,
+    dismiss_is_click: bool,
+    wait: impl FnOnce(OutcomeHandler),
+) -> ClickOutcome {
+    let (tx, rx) = mpsc::channel::<ClickOutcome>();
+    wait(OutcomeHandler {
+        tx,
+        shown_at,
+        dismiss_is_click,
+    });
+    rx.try_recv().unwrap_or(ClickOutcome::Stop)
+}
+
+/// A named [`notify_rust::ResponseHandler`] rather than a closure, so the
+/// re-arm path can hand the same handler to `handle_action`'s older
+/// `ActionResponse` callback shape.
+struct OutcomeHandler {
+    tx: mpsc::Sender<ClickOutcome>,
+    shown_at: Instant,
+    dismiss_is_click: bool,
+}
+
+impl ResponseHandler for OutcomeHandler {
+    fn call(self, response: &NotificationResponse) {
+        let outcome = classify_response(response, self.dismiss_is_click, self.shown_at.elapsed());
+        if outcome == ClickOutcome::Stop {
+            eprintln!("herdr-notifications: toast closed without action: {response:?}");
+        }
+        let _ = self.tx.send(outcome);
+    }
+}
+
+/// `handle_action` predates `NotificationResponse`; map its facade back so
+/// both wait paths share [`classify_response`].
+#[cfg(all(unix, not(target_os = "macos")))]
+fn normalize_action_response(response: &ActionResponse<'_>) -> NotificationResponse {
+    match response {
+        ActionResponse::Custom("default") => NotificationResponse::Default,
+        ActionResponse::Custom(key) => NotificationResponse::Action((*key).to_string()),
+        ActionResponse::Closed(reason) => NotificationResponse::Closed(*reason),
+    }
 }
 
 /// Best-effort: bring the pane that triggered a notification back into
@@ -725,7 +908,29 @@ mod tests {
                 assert_eq!(pane_id, "w1:p9");
                 assert_eq!(workspace_id, "w1");
                 assert_eq!(agent_status, "blocked");
-                assert_eq!(agent, "claude");
+                assert_eq!(agent.as_deref(), Some("claude"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_event_payload_accepts_explicit_nulls() {
+        // herdr 0.8 types agent/display_agent/title as ["string","null"], and
+        // #[serde(default)] only covers a *missing* key, never an explicit null.
+        let raw = r#"{"event":"pane_agent_status_changed","data":{"type":"pane_agent_status_changed","pane_id":"w1:p3","workspace_id":"w1","agent_status":"blocked","agent":null,"display_agent":null,"title":null,"state_labels":{}}}"#;
+        match parse_event_payload(raw).unwrap() {
+            EventData::PaneAgentStatusChanged {
+                pane_id,
+                agent,
+                display_agent,
+                title,
+                ..
+            } => {
+                assert_eq!(pane_id, "w1:p3");
+                assert_eq!(agent, None);
+                assert_eq!(display_agent, None);
+                assert_eq!(title, None);
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -764,12 +969,103 @@ mod tests {
     }
 
     #[test]
-    fn with_focus_hint_appends_discoverability_line() {
+    fn display_agent_name_prefers_display_then_agent_then_generic() {
+        assert_eq!(display_agent_name(Some("Claude"), Some("claude")), "Claude");
+        assert_eq!(display_agent_name(None, Some("claude")), "claude");
+        assert_eq!(display_agent_name(None, None), "agent");
+    }
+
+    #[test]
+    fn display_agent_name_treats_blank_like_absent() {
+        // herdr types these nullable, but an empty string is just as likely.
+        assert_eq!(display_agent_name(Some(""), Some("codex")), "codex");
+        assert_eq!(display_agent_name(Some("   "), None), "agent");
+    }
+
+    #[test]
+    fn classify_response_treats_activation_as_focus() {
+        let grace = POST_SHOW_LISTEN_GRACE;
+        for dismiss_is_click in [true, false] {
+            assert_eq!(
+                classify_response(&NotificationResponse::Default, dismiss_is_click, grace),
+                ClickOutcome::Focus
+            );
+            assert_eq!(
+                classify_response(
+                    &NotificationResponse::Action("default".into()),
+                    dismiss_is_click,
+                    grace
+                ),
+                ClickOutcome::Focus
+            );
+        }
+    }
+
+    #[test]
+    fn classify_response_ignores_dismiss_unless_daemon_needs_it() {
+        // GNOME/KDE/dunst/mako, Windows, macOS: closing a toast is not a click.
         assert_eq!(
-            with_focus_hint("scripts · tech rev"),
-            format!("scripts · tech rev\n{FOCUS_HINT}")
+            classify_response(
+                &NotificationResponse::Closed(CloseReason::Dismissed),
+                false,
+                POST_SHOW_LISTEN_GRACE * 2
+            ),
+            ClickOutcome::Stop
         );
-        assert_eq!(with_focus_hint(""), FOCUS_HINT);
+    }
+
+    #[test]
+    fn classify_response_reads_xfce_dismiss_as_click_after_the_grace() {
+        assert_eq!(
+            classify_response(
+                &NotificationResponse::Closed(CloseReason::Dismissed),
+                true,
+                POST_SHOW_LISTEN_GRACE
+            ),
+            ClickOutcome::Focus
+        );
+    }
+
+    #[test]
+    fn classify_response_rearms_on_dismiss_inside_the_grace() {
+        // XFCE show/replace churn: keep listening instead of exiting the wait.
+        assert_eq!(
+            classify_response(
+                &NotificationResponse::Closed(CloseReason::Dismissed),
+                true,
+                Duration::from_millis(0)
+            ),
+            ClickOutcome::Rearm
+        );
+    }
+
+    #[test]
+    fn classify_response_stops_on_expiry_and_api_close() {
+        for reason in [
+            CloseReason::Expired,
+            CloseReason::CloseAction,
+            CloseReason::Other(9),
+        ] {
+            assert_eq!(
+                classify_response(
+                    &NotificationResponse::Closed(reason),
+                    true,
+                    POST_SHOW_LISTEN_GRACE * 2
+                ),
+                ClickOutcome::Stop,
+                "{reason:?} is not a click"
+            );
+        }
+    }
+
+    #[test]
+    fn server_is_xfce_matches_what_getserverinformation_returns() {
+        // xfce4-notifyd 0.9.4 reports name "Xfce Notify Daemon", vendor "Xfce".
+        assert!(server_is_xfce("Xfce Notify Daemon", "Xfce"));
+        assert!(server_is_xfce("xfce4-notifyd", "unknown"));
+        assert!(!server_is_xfce("GNOME Shell", "GNOME"));
+        assert!(!server_is_xfce("dunst", "knopwob"));
+        assert!(!server_is_xfce("mako", "hello"));
     }
 
     #[test]

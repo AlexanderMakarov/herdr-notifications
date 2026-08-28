@@ -57,17 +57,29 @@ plugin's binary is invoked once per event:
 3. The notification is shown on a background thread with a bounded wait, so
    a stuck notification daemon can never hang the process indefinitely.
    Summary is `{agent} is done` / `{agent} needs you`; body is
-   `workspace · tab` from `HERDR_PLUGIN_CONTEXT_JSON` (fallback: cwd
-   basename from `herdr pane list`).
-4. If you click the notification body or **Open in Herdr**, the plugin runs
-   `herdr agent focus <pane_id>` to bring that pane back into view. The toast
-   body includes a short hint so body-click is discoverable on Linux.
+   `location · tab`, taken from `HERDR_PLUGIN_CONTEXT_JSON` when it describes
+   the pane that changed. Otherwise it falls back to `herdr pane list`, where
+   the first label is the pane's cwd basename (or its workspace id) and the
+   second is its tab id — close enough to place the pane, but not the
+   workspace and tab *labels* the context path gives you.
+4. On Linux/BSD the toast carries an **Open in Herdr** button. Clicking it
+   runs `herdr agent focus <pane_id>` to bring that pane back into view.
+   The toast stays up for 60 seconds, and the plugin process exits with it.
+5. Closing a notification is not a click. The one exception is
+   xfce4-notifyd, where a body click emits *only*
+   `NotificationClosed(Dismissed)` and never `ActionInvoked`; the plugin
+   detects that daemon via `GetServerInformation` and reads a dismissal as a
+   click there alone. Set `HERDR_NOTIFICATIONS_CLICK_ON_DISMISS=1` to force
+   that reading on another daemon that behaves the same way, or `=0` to turn
+   it off.
 
 Herdr 0.8+ delivers `HERDR_PLUGIN_EVENT_JSON` as
 `{"event":"…","data":{…}}`; this plugin unwraps `data` and still accepts
 older bare payloads (Herdr 0.7.x), so `min_herdr_version` stays `0.7.0`.
-Optional event fields (`agent`, `display_agent`, `title`, `workspace_id`)
-default when absent.
+`agent`, `display_agent` and `title` are typed `["string", "null"]` by herdr
+and are accepted missing, `null`, or empty; `workspace_id` is accepted
+missing. An unrecognized `agent_status` is ignored rather than treated as a
+parse failure, so a future herdr status will not break the plugin.
 
 ## Requirements
 
