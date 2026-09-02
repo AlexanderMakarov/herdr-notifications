@@ -29,14 +29,33 @@ use serde::Deserialize;
 const SHOW_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long an actionable toast stays on screen, and so how long this process
-/// lives waiting for a click. Bounded on purpose: several agents going
-/// `blocked` at once must not leave several plugin processes and D-Bus
-/// connections parked until somebody gets around to clicking.
+/// lives waiting for a click. Bounded so several agents going `blocked` at
+/// once don't leave plugin processes parked forever. Override with
+/// `HERDR_NOTIFICATIONS_TOAST_SECS` (seconds) for a longer local TTL.
 const TOAST_LIFETIME: Duration = Duration::from_secs(60);
+const TOAST_LIFETIME_ENV: &str = "HERDR_NOTIFICATIONS_TOAST_SECS";
 
-/// Safety net over [`TOAST_LIFETIME`] for a daemon that never reports the
-/// expiry (hung D-Bus, no `NotificationClosed(Expired)`).
-const CLICK_WAIT_SAFETY_TIMEOUT: Duration = Duration::from_secs(65);
+/// Extra slack over [`toast_lifetime`] for a daemon that never reports expiry.
+const CLICK_WAIT_SAFETY_SLACK: Duration = Duration::from_secs(5);
+
+fn toast_lifetime() -> Duration {
+    match env::var(TOAST_LIFETIME_ENV) {
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(secs) if secs > 0 => Duration::from_secs(secs),
+            _ => {
+                eprintln!(
+                    "herdr-notifications: invalid {TOAST_LIFETIME_ENV}={raw:?}, using {TOAST_LIFETIME:?}"
+                );
+                TOAST_LIFETIME
+            }
+        },
+        Err(_) => TOAST_LIFETIME,
+    }
+}
+
+fn click_wait_safety_timeout() -> Duration {
+    toast_lifetime().saturating_add(CLICK_WAIT_SAFETY_SLACK)
+}
 
 /// A `Dismissed` this soon after show is XFCE show/replace churn, not a user
 /// click. We stay subscribed through it rather than sleeping past it.
@@ -50,10 +69,14 @@ const MAX_LISTEN_REARMS: u32 = 3;
 /// (`0`), for daemons other than XFCE that share the behaviour.
 const CLICK_ON_DISMISS_ENV: &str = "HERDR_NOTIFICATIONS_CLICK_ON_DISMISS";
 
-/// Freedesktop default-action button label. Only rendered on XDG: `action()`
-/// is inert on the default macOS backend, so no hint text promises a button
-/// that isn't there.
-const FOCUS_ACTION_LABEL: &str = "Open in Herdr";
+/// Single actionable toast control. Body/toast click focuses Herdr; this
+/// button only dismisses. Registering a separate `default` action makes
+/// xfce4-notifyd render two buttons, so we rely on daemon-specific body-click
+/// handling instead (see [`dismiss_counts_as_click`]).
+const CLOSE_ACTION_ID: &str = "close";
+const CLOSE_ACTION_LABEL: &str = "Close";
+/// Shown on actionable status toasts; kept short for small notification bodies.
+const CLICK_HINT: &str = "Click to open";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Sound {
@@ -175,6 +198,16 @@ fn format_notification_body(primary: &str, secondary: &str, title: &str, agent: 
 /// path yields a genuine workspace label and tab label. The `herdr pane list`
 /// fallback substitutes the pane's cwd basename and tab id, which read better
 /// in a toast (`herdr-notifications` beats `w1`) but are not workspace labels.
+
+/// Append the short body-click hint for actionable status notifications.
+fn append_click_hint(body: &str) -> String {
+    if body.is_empty() {
+        CLICK_HINT.to_string()
+    } else {
+        format!("{body}\n{CLICK_HINT}")
+    }
+}
+
 fn resolve_location_labels(pane_id: &str, workspace_id: &str) -> (String, String) {
     if let Ok(raw) = env::var("HERDR_PLUGIN_CONTEXT_JSON") {
         if let Ok(ctx) = serde_json::from_str::<PluginContext>(&raw) {
@@ -377,9 +410,13 @@ fn parse_notify_args(args: Vec<String>) -> Result<(String, String, Sound), Strin
 /// process stays alive until the toast is activated or dismissed.
 fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Option<&str>) -> Result<(), ()> {
     let summary = summary.to_string();
-    let body = body.to_string();
-    let click_target = click_target.map(str::to_string);
     let wants_click = click_target.is_some();
+    let body = if wants_click {
+        append_click_hint(body)
+    } else {
+        body.to_string()
+    };
+    let click_target = click_target.map(str::to_string);
 
     let (shown_tx, shown_rx) = mpsc::channel::<Result<(), String>>();
     let (click_tx, click_rx) = mpsc::channel::<Option<String>>();
@@ -396,11 +433,13 @@ fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Opti
             notification.sound_name(name);
         }
         if wants_click {
-            notification.action("default", FOCUS_ACTION_LABEL);
+            notification.action(CLOSE_ACTION_ID, CLOSE_ACTION_LABEL);
             // Leave urgency alone: Normal is already the XDG default, and
             // `urgency()` does not exist on the default macOS backend
             // (notify-rust gates it behind the `preview-macos-un` feature).
-            notification.timeout(Timeout::Milliseconds(TOAST_LIFETIME.as_millis() as u32));
+            notification.timeout(Timeout::Milliseconds(
+                toast_lifetime().as_millis() as u32,
+            ));
         }
 
         let handle = match notification.show() {
@@ -434,12 +473,13 @@ fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Opti
     };
 
     if wants_click && shown.is_ok() {
-        match click_rx.recv_timeout(CLICK_WAIT_SAFETY_TIMEOUT) {
+        let wait = click_wait_safety_timeout();
+        match click_rx.recv_timeout(wait) {
             Ok(Some(pane_id)) => focus_pane(&pane_id),
             Ok(None) => {}
             Err(_) => {
                 eprintln!(
-                    "herdr-notifications: no click/dismiss within {CLICK_WAIT_SAFETY_TIMEOUT:?}; giving up"
+                    "herdr-notifications: no click/dismiss within {wait:?}; giving up"
                 );
             }
         }
@@ -476,7 +516,9 @@ fn classify_response(
     since_show: Duration,
 ) -> ClickOutcome {
     match response {
-        NotificationResponse::Default | NotificationResponse::Action(_) => ClickOutcome::Focus,
+        NotificationResponse::Default => ClickOutcome::Focus,
+        NotificationResponse::Action(key) if key == CLOSE_ACTION_ID => ClickOutcome::Stop,
+        NotificationResponse::Action(_) => ClickOutcome::Focus,
         NotificationResponse::Closed(CloseReason::Dismissed) if dismiss_is_click => {
             if since_show >= POST_SHOW_LISTEN_GRACE {
                 ClickOutcome::Focus
@@ -980,6 +1022,26 @@ mod tests {
         // herdr types these nullable, but an empty string is just as likely.
         assert_eq!(display_agent_name(Some(""), Some("codex")), "codex");
         assert_eq!(display_agent_name(Some("   "), None), "agent");
+    }
+
+    #[test]
+    fn append_click_hint_adds_short_line() {
+        assert_eq!(append_click_hint("scripts · tab"), "scripts · tab\nClick to open");
+        assert_eq!(append_click_hint(""), "Click to open");
+    }
+
+    #[test]
+    fn classify_response_close_action_stops_without_focus() {
+        for dismiss_is_click in [true, false] {
+            assert_eq!(
+                classify_response(
+                    &NotificationResponse::Action(CLOSE_ACTION_ID.into()),
+                    dismiss_is_click,
+                    POST_SHOW_LISTEN_GRACE * 2
+                ),
+                ClickOutcome::Stop
+            );
+        }
     }
 
     #[test]
