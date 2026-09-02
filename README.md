@@ -13,7 +13,9 @@ terminal.
   re-notifies — but a `blocked → working → blocked` cycle correctly notifies
   again, since it's not a repeat.
 - **Click to focus**: clicking a status-change notification focuses the
-  originating pane back in herdr.
+  originating pane back in herdr. On Linux, set
+  `HERDR_NOTIFICATIONS_RAISE_HOST=1` to also raise the terminal window that
+  hosts the Herdr UI (KDE, GNOME, XFCE/X11, Hyprland, Sway — best-effort).
 - **Location in the toast**: body shows `workspace · tab` (and the agent
   title when present) so you can tell which project fired, not only which
   agent binary.
@@ -87,6 +89,9 @@ parse failure, so a future herdr status will not break the plugin.
 - A working OS notification backend: a D-Bus session + notification daemon
   on Linux/BSD (present on virtually every desktop environment), or the
   native notification center on macOS/Windows.
+- Optional (Linux host-window raise): one or more of `wmctrl`, `xdotool`,
+  `qdbus`/`qdbus6` (KDE), `gdbus` (GNOME), `hyprctl` (Hyprland), or
+  `swaymsg` (Sway), depending on your desktop.
 
 ## Development
 

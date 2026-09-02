@@ -50,6 +50,12 @@ const MAX_LISTEN_REARMS: u32 = 3;
 /// (`0`), for daemons other than XFCE that share the behaviour.
 const CLICK_ON_DISMISS_ENV: &str = "HERDR_NOTIFICATIONS_CLICK_ON_DISMISS";
 
+/// Raise the OS window hosting the Herdr UI client after a notification click.
+/// Opt in with `1`; default off. Linux only — uses desktop-specific APIs where
+/// available (KDE KWin, GNOME Shell, Hyprland, Sway) and falls back to X11
+/// `wmctrl`/`xdotool`.
+const RAISE_HOST_ENV: &str = "HERDR_NOTIFICATIONS_RAISE_HOST";
+
 /// Freedesktop default-action button label. Only rendered on XDG: `action()`
 /// is inert on the default macOS backend, so no hint text promises a button
 /// that isn't there.
@@ -623,6 +629,10 @@ fn normalize_action_response(response: &ActionResponse<'_>) -> NotificationRespo
 /// focus in herdr when the user clicks it. Uses the `herdr` binary herdr
 /// hands every plugin process via $HERDR_BIN_PATH (falling back to `herdr`
 /// on PATH) rather than talking to the socket API directly.
+///
+/// On Linux, when [`should_raise_host_window`] is enabled, also raises the OS
+/// window that hosts the Herdr UI client (`herdr agent focus` only switches
+/// the pane inside Herdr).
 fn focus_pane(pane_id: &str) {
     let bin = env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
     match Command::new(&bin).args(["agent", "focus", pane_id]).output() {
@@ -636,6 +646,334 @@ fn focus_pane(pane_id: &str) {
             eprintln!("herdr-notifications: failed to run '{bin}' to focus pane {pane_id}: {e}");
         }
         _ => {}
+    }
+    if should_raise_host_window() {
+        raise_herdr_host_window();
+    }
+}
+
+fn should_raise_host_window() -> bool {
+    matches!(env::var(RAISE_HOST_ENV).as_deref(), Ok("1"))
+}
+
+/// Linux desktop hint derived from session environment variables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxDesktop {
+    Kde,
+    Gnome,
+    Xfce,
+    Generic,
+}
+
+/// Pure helper: map `XDG_CURRENT_DESKTOP` / `DESKTOP_SESSION` strings to a
+/// coarse desktop profile for choosing a raise strategy.
+fn linux_desktop_from_env(desktop: &str, session: &str) -> LinuxDesktop {
+    let combined = format!("{desktop} {session}").to_ascii_lowercase();
+    if ["kde", "plasma"].iter().any(|token| combined.contains(token)) {
+        LinuxDesktop::Kde
+    } else if ["gnome", "ubuntu:gnome", "unity"]
+        .iter()
+        .any(|token| combined.contains(token))
+    {
+        LinuxDesktop::Gnome
+    } else if combined.contains("xfce") {
+        LinuxDesktop::Xfce
+    } else {
+        LinuxDesktop::Generic
+    }
+}
+
+/// True when `argv` looks like a long-lived Herdr UI client (`herdr`,
+/// `herdr --session …`), not `herdr server` or short CLI helpers like
+/// `herdr agent focus`.
+fn is_herdr_ui_client_argv(argv: &[String]) -> bool {
+    let Some(bin) = argv.first() else {
+        return false;
+    };
+    let Some(name) = Path::new(bin).file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    if name != "herdr" {
+        return false;
+    }
+    match argv.get(1).map(String::as_str) {
+        None => true,
+        Some(arg) if arg.starts_with('-') => true,
+        Some(_) => false,
+    }
+}
+
+/// Walk each client PID's parent chain and return the first window id a
+/// lookup finds. Pure so unit tests can inject parent/window maps.
+fn pick_host_window_id(
+    client_pids: &[u32],
+    parent_of: impl Fn(u32) -> Option<u32>,
+    window_for: impl Fn(u32) -> Option<String>,
+) -> Option<String> {
+    for &start in client_pids {
+        let mut pid = start;
+        // Cap depth so a corrupt parent loop cannot hang the plugin.
+        for _ in 0..64 {
+            if let Some(wid) = window_for(pid) {
+                return Some(wid);
+            }
+            match parent_of(pid) {
+                Some(parent) if parent > 1 && parent != pid => pid = parent,
+                _ => break,
+            }
+        }
+    }
+    None
+}
+
+/// Best-effort: activate the terminal/GUI window that owns a Herdr UI client.
+/// No-op when not on Linux or when no host window can be found.
+fn raise_herdr_host_window() {
+    #[cfg(target_os = "linux")]
+    {
+        let clients = linux_herdr_ui_client_pids();
+        if clients.is_empty() {
+            return;
+        }
+        let desktop = linux_desktop_from_env(
+            &env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
+            &env::var("DESKTOP_SESSION").unwrap_or_default(),
+        );
+        for &pid in &clients {
+            if linux_raise_client_pid(pid, desktop) {
+                return;
+            }
+        }
+        eprintln!(
+            "herdr-notifications: focused pane but could not find a host window to raise"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_raise_client_pid(pid: u32, desktop: LinuxDesktop) -> bool {
+    match desktop {
+        LinuxDesktop::Kde if linux_kde_activate_pid(pid) => return true,
+        LinuxDesktop::Gnome if linux_gnome_activate_pid(pid) => return true,
+        _ => {}
+    }
+    if linux_hyprland_focus_pid(pid) {
+        return true;
+    }
+    if linux_sway_focus_pid(pid) {
+        return true;
+    }
+    if linux_is_x11() {
+        if let Some(wid) = pick_host_window_id(&[pid], linux_parent_pid, linux_x11_window_id_for_pid)
+        {
+            if linux_x11_activate_window(&wid).is_ok() {
+                return true;
+            }
+        }
+    }
+    // Ambiguous Wayland session: try compositor APIs even when the desktop
+    // string didn't match (e.g. custom session names).
+    if !linux_is_x11() {
+        if linux_kde_activate_pid(pid) {
+            return true;
+        }
+        if linux_gnome_activate_pid(pid) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn linux_is_x11() -> bool {
+    env::var("WAYLAND_DISPLAY").is_err() && env::var("DISPLAY").is_ok()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_herdr_ui_client_pids() -> Vec<u32> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut pids = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid_str) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        let cmdline_path = entry.path().join("cmdline");
+        let Ok(bytes) = fs::read(&cmdline_path) else {
+            continue;
+        };
+        if bytes.is_empty() {
+            continue;
+        }
+        let argv: Vec<String> = bytes
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+        if is_herdr_ui_client_argv(&argv) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+#[cfg(target_os = "linux")]
+fn linux_parent_pid(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `/proc/pid/stat`: pid (comm) state ppid ... — comm may contain spaces/parens,
+    // so take the field after the last ')' then skip state.
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_x11_window_id_for_pid(pid: u32) -> Option<String> {
+    let output = Command::new("xdotool")
+        .args(["search", "--pid", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let wid = stdout.lines().next()?.trim();
+    if wid.is_empty() {
+        None
+    } else {
+        Some(wid.to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_kde_activate_pid(pid: u32) -> bool {
+    for qdbus in ["qdbus6", "qdbus"] {
+        let Ok(wid_out) = Command::new(qdbus)
+            .args([
+                "org.kde.KWin",
+                "/KWin",
+                "org.kde.KWin.windowByPid",
+                &pid.to_string(),
+            ])
+            .output()
+        else {
+            continue;
+        };
+        if !wid_out.status.success() {
+            continue;
+        }
+        let wid = String::from_utf8_lossy(&wid_out.stdout).trim().to_string();
+        if wid.is_empty() {
+            continue;
+        }
+        for method in ["org.kde.KWin.activateWindow", "org.kde.KWin.forceActiveWindow"] {
+            if let Ok(act) = Command::new(qdbus)
+                .args(["org.kde.KWin", "/KWin", method, &wid])
+                .output()
+                && act.status.success()
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn linux_gnome_activate_pid(pid: u32) -> bool {
+    let script = format!(
+        "global.get_window_tracker().list_all_windows().forEach(function(w) {{ if (w.get_pid() === {pid}) w.activate(global.get_current_time()); }});"
+    );
+    let Ok(output) = Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.gnome.Shell",
+            "--object-path",
+            "/org/gnome/Shell",
+            "--method",
+            "org.gnome.Shell.Eval",
+            "s",
+            &script,
+        ])
+        .output()
+    else {
+        return false;
+    };
+    output.status.success()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_hyprland_focus_pid(pid: u32) -> bool {
+    if env::var("HYPRLAND_INSTANCE_SIGNATURE").is_err() {
+        return false;
+    }
+    Command::new("hyprctl")
+        .args(["dispatch", "focuswindow", &format!("pid:{pid}")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_sway_focus_pid(pid: u32) -> bool {
+    if env::var("SWAYSOCK").is_err() {
+        return false;
+    }
+    Command::new("swaymsg")
+        .args([&format!("[con_pid={pid}]"), "focus"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_x11_activate_window(wid: &str) -> Result<(), String> {
+    // Prefer wmctrl (handles desktop switch + raise well on XFCE and many WMs);
+    // fall back to xdotool. Accept decimal or 0x-hex ids from xdotool/wmctrl.
+    let hex = if let Some(stripped) = wid.strip_prefix("0x").or_else(|| wid.strip_prefix("0X")) {
+        format!("0x{stripped}")
+    } else if let Ok(n) = wid.parse::<u64>() {
+        format!("0x{n:x}")
+    } else {
+        wid.to_string()
+    };
+
+    let wmctrl = Command::new("wmctrl").args(["-ia", &hex]).output();
+    match wmctrl {
+        Ok(out) if out.status.success() => return Ok(()),
+        Ok(out) => {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let xd = Command::new("xdotool")
+                .args(["windowactivate", "--sync", wid])
+                .output()
+                .map_err(|e| e.to_string())?;
+            if xd.status.success() {
+                Ok(())
+            } else {
+                Err(if err.is_empty() {
+                    String::from_utf8_lossy(&xd.stderr).trim().to_string()
+                } else {
+                    err
+                })
+            }
+        }
+        Err(_) => {
+            let xd = Command::new("xdotool")
+                .args(["windowactivate", "--sync", wid])
+                .output()
+                .map_err(|e| e.to_string())?;
+            if xd.status.success() {
+                Ok(())
+            } else {
+                Err(String::from_utf8_lossy(&xd.stderr).trim().to_string())
+            }
+        }
     }
 }
 
@@ -1056,6 +1394,84 @@ mod tests {
                 "{reason:?} is not a click"
             );
         }
+    }
+
+    #[test]
+    fn should_raise_host_window_matches_env_flag() {
+        assert_eq!(
+            should_raise_host_window(),
+            matches!(env::var(RAISE_HOST_ENV).as_deref(), Ok("1"))
+        );
+    }
+
+    #[test]
+    fn linux_desktop_from_env_detects_common_sessions() {
+        assert_eq!(
+            linux_desktop_from_env("KDE", "plasma"),
+            LinuxDesktop::Kde
+        );
+        assert_eq!(
+            linux_desktop_from_env("GNOME", "ubuntu"),
+            LinuxDesktop::Gnome
+        );
+        assert_eq!(
+            linux_desktop_from_env("XFCE", "xfce"),
+            LinuxDesktop::Xfce
+        );
+        assert_eq!(
+            linux_desktop_from_env("i3", "i3"),
+            LinuxDesktop::Generic
+        );
+    }
+
+    #[test]
+    fn is_herdr_ui_client_argv_accepts_bare_and_flag_launches() {
+        assert!(is_herdr_ui_client_argv(&["herdr".into()]));
+        assert!(is_herdr_ui_client_argv(&["/home/u/.local/bin/herdr".into()]));
+        assert!(is_herdr_ui_client_argv(&[
+            "herdr".into(),
+            "--session".into(),
+            "main".into()
+        ]));
+    }
+
+    #[test]
+    fn is_herdr_ui_client_argv_rejects_server_and_cli_subcommands() {
+        assert!(!is_herdr_ui_client_argv(&["herdr".into(), "server".into()]));
+        assert!(!is_herdr_ui_client_argv(&[
+            "/home/u/.local/bin/herdr".into(),
+            "server".into()
+        ]));
+        assert!(!is_herdr_ui_client_argv(&[
+            "herdr".into(),
+            "agent".into(),
+            "focus".into(),
+            "w1:p1".into()
+        ]));
+        assert!(!is_herdr_ui_client_argv(&["bash".into()]));
+        assert!(!is_herdr_ui_client_argv(&[]));
+    }
+
+    #[test]
+    fn pick_host_window_id_walks_client_ancestors_to_wezterm() {
+        // client 100 → bash 50 → wezterm 10 (has window); unrelated 200 → 99 (no window)
+        let parent = |pid: u32| match pid {
+            100 => Some(50),
+            50 => Some(10),
+            10 => Some(1),
+            200 => Some(99),
+            99 => Some(1),
+            _ => None,
+        };
+        let window_for = |pid: u32| match pid {
+            10 => Some("0xabc".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            pick_host_window_id(&[100, 200], parent, window_for).as_deref(),
+            Some("0xabc")
+        );
+        assert_eq!(pick_host_window_id(&[200], parent, window_for), None);
     }
 
     #[test]
