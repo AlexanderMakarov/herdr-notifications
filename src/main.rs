@@ -29,33 +29,14 @@ use serde::Deserialize;
 const SHOW_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long an actionable toast stays on screen, and so how long this process
-/// lives waiting for a click. Bounded so several agents going `blocked` at
-/// once don't leave plugin processes parked forever. Override with
-/// `HERDR_NOTIFICATIONS_TOAST_SECS` (seconds) for a longer local TTL.
+/// lives waiting for a click. Bounded on purpose: several agents going
+/// `blocked` at once must not leave several plugin processes and D-Bus
+/// connections parked until somebody gets around to clicking.
 const TOAST_LIFETIME: Duration = Duration::from_secs(60);
-const TOAST_LIFETIME_ENV: &str = "HERDR_NOTIFICATIONS_TOAST_SECS";
 
-/// Extra slack over [`toast_lifetime`] for a daemon that never reports expiry.
-const CLICK_WAIT_SAFETY_SLACK: Duration = Duration::from_secs(5);
-
-fn toast_lifetime() -> Duration {
-    match env::var(TOAST_LIFETIME_ENV) {
-        Ok(raw) => match raw.parse::<u64>() {
-            Ok(secs) if secs > 0 => Duration::from_secs(secs),
-            _ => {
-                eprintln!(
-                    "herdr-notifications: invalid {TOAST_LIFETIME_ENV}={raw:?}, using {TOAST_LIFETIME:?}"
-                );
-                TOAST_LIFETIME
-            }
-        },
-        Err(_) => TOAST_LIFETIME,
-    }
-}
-
-fn click_wait_safety_timeout() -> Duration {
-    toast_lifetime().saturating_add(CLICK_WAIT_SAFETY_SLACK)
-}
+/// Safety net over [`TOAST_LIFETIME`] for a daemon that never reports the
+/// expiry (hung D-Bus, no `NotificationClosed(Expired)`).
+const CLICK_WAIT_SAFETY_TIMEOUT: Duration = Duration::from_secs(65);
 
 /// A `Dismissed` this soon after show is XFCE show/replace churn, not a user
 /// click. We stay subscribed through it rather than sleeping past it.
@@ -437,9 +418,7 @@ fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Opti
             // Leave urgency alone: Normal is already the XDG default, and
             // `urgency()` does not exist on the default macOS backend
             // (notify-rust gates it behind the `preview-macos-un` feature).
-            notification.timeout(Timeout::Milliseconds(
-                toast_lifetime().as_millis() as u32,
-            ));
+            notification.timeout(Timeout::Milliseconds(TOAST_LIFETIME.as_millis() as u32));
         }
 
         let handle = match notification.show() {
@@ -473,13 +452,12 @@ fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Opti
     };
 
     if wants_click && shown.is_ok() {
-        let wait = click_wait_safety_timeout();
-        match click_rx.recv_timeout(wait) {
+        match click_rx.recv_timeout(CLICK_WAIT_SAFETY_TIMEOUT) {
             Ok(Some(pane_id)) => focus_pane(&pane_id),
             Ok(None) => {}
             Err(_) => {
                 eprintln!(
-                    "herdr-notifications: no click/dismiss within {wait:?}; giving up"
+                    "herdr-notifications: no click/dismiss within {CLICK_WAIT_SAFETY_TIMEOUT:?}; giving up"
                 );
             }
         }
