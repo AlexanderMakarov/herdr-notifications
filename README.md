@@ -66,7 +66,11 @@ plugin's binary is invoked once per event:
    workspace and tab *labels* the context path gives you.
 4. On Linux/BSD the toast carries an **Open in Herdr** button. Clicking it
    runs `herdr agent focus <pane_id>` to bring that pane back into view.
-   The toast stays up for 60 seconds, and the plugin process exits with it.
+   On Linux, opt in with `HERDR_NOTIFICATIONS_RAISE_HOST=1` to also raise the
+   host terminal window via desktop-specific APIs (KWin on KDE, GNOME Shell
+   Eval on GNOME, `hyprctl`/`swaymsg` on those compositors, `wmctrl`/`xdotool`
+   on X11). The toast stays up for 60 seconds, and the plugin process exits
+   with it.
 5. Closing a notification is not a click. The one exception is
    xfce4-notifyd, where a body click emits *only*
    `NotificationClosed(Dismissed)` and never `ActionInvoked`; the plugin
