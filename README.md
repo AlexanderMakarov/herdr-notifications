@@ -72,9 +72,11 @@ plugin's binary is invoked once per event:
    xfce4-notifyd, where a body click emits *only*
    `NotificationClosed(Dismissed)` and never `ActionInvoked`; the plugin
    detects that daemon via `GetServerInformation` and reads a dismissal as a
-   click there alone. Set `HERDR_NOTIFICATIONS_CLICK_ON_DISMISS=1` to force
-   that reading on another daemon that behaves the same way, or `=0` to turn
-   it off.
+   click there alone. xfce4-notifyd also emits an immediate post-show
+   `Dismissed` as replace churn; the plugin re-subscribes through that and
+   treats the next dismissal as the body click. Set
+   `HERDR_NOTIFICATIONS_CLICK_ON_DISMISS=1` to force that reading on another
+   daemon that behaves the same way, or `=0` to turn it off.
 
 Herdr 0.8+ delivers `HERDR_PLUGIN_EVENT_JSON` as
 `{"event":"…","data":{…}}`; this plugin unwraps `data` and still accepts
