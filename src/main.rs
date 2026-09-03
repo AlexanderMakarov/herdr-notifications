@@ -733,6 +733,9 @@ fn raise_herdr_host_window() {
     {
         let clients = linux_herdr_ui_client_pids();
         if clients.is_empty() {
+            eprintln!(
+                "herdr-notifications: focused pane but found no Herdr UI client to raise"
+            );
             return;
         }
         let desktop = linux_desktop_from_env(
@@ -934,8 +937,9 @@ fn linux_sway_focus_pid(pid: u32) -> bool {
 
 #[cfg(target_os = "linux")]
 fn linux_x11_activate_window(wid: &str) -> Result<(), String> {
-    // Prefer wmctrl (handles desktop switch + raise well on XFCE and many WMs);
-    // fall back to xdotool. Accept decimal or 0x-hex ids from xdotool/wmctrl.
+    // Prefer wmctrl (handles desktop switch + raise well on XFCE and many WMs).
+    // Also run xdotool activate/raise/focus: some WMs (notably XFCE with
+    // raise_on_focus=false) can focus without bringing the window forward.
     let hex = if let Some(stripped) = wid.strip_prefix("0x").or_else(|| wid.strip_prefix("0X")) {
         format!("0x{stripped}")
     } else if let Ok(n) = wid.parse::<u64>() {
@@ -944,37 +948,47 @@ fn linux_x11_activate_window(wid: &str) -> Result<(), String> {
         wid.to_string()
     };
 
-    let wmctrl = Command::new("wmctrl").args(["-ia", &hex]).output();
-    match wmctrl {
+    let mut errors = Vec::new();
+    match Command::new("wmctrl").args(["-ia", &hex]).output() {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => errors.push(format!(
+            "wmctrl: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => errors.push(format!("wmctrl: {e}")),
+    }
+
+    let xd = Command::new("xdotool")
+        .args([
+            "windowactivate",
+            "--sync",
+            wid,
+            "windowraise",
+            wid,
+            "windowfocus",
+            "--sync",
+            wid,
+        ])
+        .output();
+    match xd {
         Ok(out) if out.status.success() => return Ok(()),
         Ok(out) => {
             let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            let xd = Command::new("xdotool")
-                .args(["windowactivate", "--sync", wid])
-                .output()
-                .map_err(|e| e.to_string())?;
-            if xd.status.success() {
-                Ok(())
-            } else {
-                Err(if err.is_empty() {
-                    String::from_utf8_lossy(&xd.stderr).trim().to_string()
-                } else {
-                    err
-                })
+            // wmctrl alone is enough when xdotool fails after a successful raise.
+            if errors.is_empty() {
+                return Ok(());
             }
+            errors.push(format!("xdotool: {err}"));
         }
-        Err(_) => {
-            let xd = Command::new("xdotool")
-                .args(["windowactivate", "--sync", wid])
-                .output()
-                .map_err(|e| e.to_string())?;
-            if xd.status.success() {
-                Ok(())
-            } else {
-                Err(String::from_utf8_lossy(&xd.stderr).trim().to_string())
+        Err(e) => {
+            if errors.is_empty() {
+                return Ok(());
             }
+            errors.push(format!("xdotool: {e}"));
         }
     }
+
+    Err(errors.join("; "))
 }
 
 /// Dedupe notifications: only fire when this pane's status actually changed
