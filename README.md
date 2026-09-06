@@ -83,8 +83,11 @@ plugin's binary is invoked once per event:
    on KDE, GNOME Shell Eval on GNOME, `hyprctl`/`swaymsg` on those
    compositors, `wmctrl` plus `xdotool` activate/raise/focus on X11 —
    needed when the WM focuses without raising, e.g. XFCE
-   `raise_on_focus=false`). The toast stays up for 60 seconds, and the
-   plugin process exits with it.
+   `raise_on_focus=false`). If the plugin process has no `DISPLAY`
+   (common when `herdr server` is started by systemd), it imports
+   `DISPLAY` / desktop vars from the Herdr UI client's `/proc` environ
+   before raising. The toast stays up for 60 seconds, and the plugin
+   process exits with it.
 6. Closing a notification is not a click. The one exception is
    xfce4-notifyd, where a body click emits *only*
    `NotificationClosed(Dismissed)` and never `ActionInvoked`; the plugin
