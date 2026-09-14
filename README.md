@@ -11,7 +11,8 @@ terminal.
 - **Only notifies when it matters**: fires on `blocked` (agent needs input)
   and `done` (agent finished), and dedupes so an unchanged status never
   re-notifies — but a `blocked → working → blocked` cycle correctly notifies
-  again, since it's not a repeat.
+  again, since it's not a repeat. The first event for a pane seeds dedup state
+  silently, so restarting `herdr server` does not toast every restored agent.
 - **Click to focus**: clicking a status-change notification focuses the
   originating pane back in herdr.
 - **Location in the toast**: body shows `workspace · tab` (and the agent
@@ -50,7 +51,10 @@ plugin's binary is invoked once per event:
 1. Every status transition is recorded to a small on-disk dedup table (one
    entry per pane), written atomically (temp file + rename) and guarded by
    a short-lived exclusive lock, so concurrent status changes across
-   multiple panes can't corrupt or race on it.
+   multiple panes can't corrupt or race on it. The first time a pane is seen
+   (including after server startup when herdr re-emits every pane's current
+   status) the entry is seeded without notifying; only later transitions
+   can surface a toast.
 2. Only `blocked` and `done` are surfaced as notifications — `idle` /
    `working` / `unknown` are recorded (so the next `blocked`/`done` is
    correctly recognized as new) but never notify on their own.
