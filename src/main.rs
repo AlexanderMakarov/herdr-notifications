@@ -647,12 +647,29 @@ fn should_notify(pane_id: &str, agent_status: &str) -> bool {
     let path = state_file_path();
     with_state_lock(&path, || {
         let mut state = load_state(&path);
-        let changed = record_status_if_changed(&mut state, pane_id, agent_status);
-        if changed {
+        let had_pane = state.contains_key(pane_id);
+        let notify = record_status_for_notify(&mut state, pane_id, agent_status);
+        if notify || !had_pane {
             save_state(&path, &state);
         }
-        changed
+        notify
     })
+}
+
+/// Pure dedup-table update: records `agent_status` for `pane_id`, returning
+/// whether a notification should fire. The first time a pane is seen the status
+/// is seeded silently (herdr re-emits every pane on server startup); only later
+/// transitions notify.
+fn record_status_for_notify(
+    state: &mut HashMap<String, String>,
+    pane_id: &str,
+    agent_status: &str,
+) -> bool {
+    if !state.contains_key(pane_id) {
+        state.insert(pane_id.to_string(), agent_status.to_string());
+        return false;
+    }
+    record_status_if_changed(state, pane_id, agent_status)
 }
 
 /// Pure dedup-table update: records `agent_status` for `pane_id`, returning
@@ -839,6 +856,28 @@ mod tests {
     fn record_status_first_seen_changes() {
         let mut state = HashMap::new();
         assert!(record_status_if_changed(&mut state, "p1", "blocked"));
+    }
+
+    #[test]
+    fn record_status_for_notify_seeds_first_sight_without_notify() {
+        let mut state = HashMap::new();
+        assert!(!record_status_for_notify(&mut state, "p1", "blocked"));
+        assert_eq!(state.get("p1").map(String::as_str), Some("blocked"));
+    }
+
+    #[test]
+    fn record_status_for_notify_same_status_after_seed_does_not_notify() {
+        let mut state = HashMap::new();
+        assert!(!record_status_for_notify(&mut state, "p1", "blocked"));
+        assert!(!record_status_for_notify(&mut state, "p1", "blocked"));
+    }
+
+    #[test]
+    fn record_status_for_notify_transitions_after_seed_notify() {
+        let mut state = HashMap::new();
+        assert!(!record_status_for_notify(&mut state, "p1", "blocked"));
+        assert!(record_status_for_notify(&mut state, "p1", "working"));
+        assert!(record_status_for_notify(&mut state, "p1", "blocked"));
     }
 
     #[test]
