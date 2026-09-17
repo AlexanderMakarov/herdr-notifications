@@ -647,29 +647,62 @@ fn should_notify(pane_id: &str, agent_status: &str) -> bool {
     let path = state_file_path();
     with_state_lock(&path, || {
         let mut state = load_state(&path);
-        let had_pane = state.contains_key(pane_id);
-        let notify = record_status_for_notify(&mut state, pane_id, agent_status);
-        if notify || !had_pane {
+        let update = record_status_for_notify(&mut state, pane_id, agent_status);
+        if update.changed {
             save_state(&path, &state);
         }
-        notify
+        update.notify
     })
 }
 
-/// Pure dedup-table update: records `agent_status` for `pane_id`, returning
-/// whether a notification should fire. The first time a pane is seen the status
-/// is seeded silently (herdr re-emits every pane on server startup); only later
-/// transitions notify.
+/// Result of recording a status into the dedup table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatusUpdate {
+    /// The on-disk entry changed (including first-sight seeds).
+    changed: bool,
+    /// Whether this transition should surface a notification.
+    notify: bool,
+}
+
+/// Pure dedup-table update: records `agent_status` for `pane_id`.
+///
+/// First sight seeds silently (no notify). Later transitions notify only when
+/// they look like real work stopping — `working → blocked` / `working → done`,
+/// plus `blocked → done` — so server restore churn through `idle`/`unknown`
+/// does not toast every restored agent.
 fn record_status_for_notify(
     state: &mut HashMap<String, String>,
     pane_id: &str,
     agent_status: &str,
-) -> bool {
-    if !state.contains_key(pane_id) {
+) -> StatusUpdate {
+    let Some(previous) = state.get(pane_id).map(String::as_str) else {
         state.insert(pane_id.to_string(), agent_status.to_string());
-        return false;
+        return StatusUpdate {
+            changed: true,
+            notify: false,
+        };
+    };
+    if previous == agent_status {
+        return StatusUpdate {
+            changed: false,
+            notify: false,
+        };
     }
-    record_status_if_changed(state, pane_id, agent_status)
+    let notify = should_notify_transition(previous, agent_status);
+    state.insert(pane_id.to_string(), agent_status.to_string());
+    StatusUpdate {
+        changed: true,
+        notify,
+    }
+}
+
+/// Whether a recorded status transition is worth a toast.
+fn should_notify_transition(previous: &str, agent_status: &str) -> bool {
+    match agent_status {
+        "blocked" => previous == "working",
+        "done" => matches!(previous, "working" | "blocked"),
+        _ => false,
+    }
 }
 
 /// Pure dedup-table update: records `agent_status` for `pane_id`, returning
@@ -861,23 +894,74 @@ mod tests {
     #[test]
     fn record_status_for_notify_seeds_first_sight_without_notify() {
         let mut state = HashMap::new();
-        assert!(!record_status_for_notify(&mut state, "p1", "blocked"));
+        assert_eq!(
+            record_status_for_notify(&mut state, "p1", "blocked"),
+            StatusUpdate {
+                changed: true,
+                notify: false,
+            }
+        );
         assert_eq!(state.get("p1").map(String::as_str), Some("blocked"));
     }
 
     #[test]
     fn record_status_for_notify_same_status_after_seed_does_not_notify() {
         let mut state = HashMap::new();
-        assert!(!record_status_for_notify(&mut state, "p1", "blocked"));
-        assert!(!record_status_for_notify(&mut state, "p1", "blocked"));
+        assert!(!record_status_for_notify(&mut state, "p1", "blocked").notify);
+        assert_eq!(
+            record_status_for_notify(&mut state, "p1", "blocked"),
+            StatusUpdate {
+                changed: false,
+                notify: false,
+            }
+        );
     }
 
     #[test]
-    fn record_status_for_notify_transitions_after_seed_notify() {
+    fn record_status_for_notify_working_to_blocked_or_done_notifies() {
         let mut state = HashMap::new();
-        assert!(!record_status_for_notify(&mut state, "p1", "blocked"));
-        assert!(record_status_for_notify(&mut state, "p1", "working"));
-        assert!(record_status_for_notify(&mut state, "p1", "blocked"));
+        assert!(!record_status_for_notify(&mut state, "p1", "working").notify);
+        assert!(record_status_for_notify(&mut state, "p1", "blocked").notify);
+        assert!(!record_status_for_notify(&mut state, "p1", "working").notify);
+        assert!(record_status_for_notify(&mut state, "p1", "done").notify);
+    }
+
+    #[test]
+    fn record_status_for_notify_blocked_to_done_notifies() {
+        let mut state = HashMap::new();
+        state.insert("p1".into(), "blocked".into());
+        assert!(record_status_for_notify(&mut state, "p1", "done").notify);
+    }
+
+    #[test]
+    fn record_status_for_notify_restore_churn_does_not_notify() {
+        // Laptop reboot: herdr walks idle/unknown before settling on done/blocked.
+        let mut state = HashMap::new();
+        state.insert("p1".into(), "done".into());
+        assert!(!record_status_for_notify(&mut state, "p1", "unknown").notify);
+        assert!(!record_status_for_notify(&mut state, "p1", "done").notify);
+        assert!(!record_status_for_notify(&mut state, "p1", "idle").notify);
+        assert!(!record_status_for_notify(&mut state, "p1", "blocked").notify);
+    }
+
+    #[test]
+    fn record_status_for_notify_working_cycle_notifies_again() {
+        let mut state = HashMap::new();
+        assert!(!record_status_for_notify(&mut state, "p1", "working").notify);
+        assert!(record_status_for_notify(&mut state, "p1", "blocked").notify);
+        assert!(!record_status_for_notify(&mut state, "p1", "working").notify);
+        assert!(record_status_for_notify(&mut state, "p1", "blocked").notify);
+    }
+
+    #[test]
+    fn should_notify_transition_matches_live_work_stopping() {
+        assert!(should_notify_transition("working", "blocked"));
+        assert!(should_notify_transition("working", "done"));
+        assert!(should_notify_transition("blocked", "done"));
+        assert!(!should_notify_transition("idle", "blocked"));
+        assert!(!should_notify_transition("unknown", "done"));
+        assert!(!should_notify_transition("done", "blocked"));
+        assert!(!should_notify_transition("working", "idle"));
     }
 
     #[test]
