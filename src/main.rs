@@ -16,6 +16,8 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -40,7 +42,7 @@ const CLICK_WAIT_SAFETY_TIMEOUT: Duration = Duration::from_secs(65);
 
 /// A `Dismissed` this soon after show is XFCE show/replace churn, not a user
 /// click. We stay subscribed through it rather than sleeping past it.
-const POST_SHOW_LISTEN_GRACE: Duration = Duration::from_millis(750);
+const POST_SHOW_LISTEN_GRACE: Duration = Duration::from_millis(150);
 
 /// Cap on re-subscribes after churn, so a daemon emitting a signal storm
 /// cannot spin this thread.
@@ -50,10 +52,14 @@ const MAX_LISTEN_REARMS: u32 = 3;
 /// (`0`), for daemons other than XFCE that share the behaviour.
 const CLICK_ON_DISMISS_ENV: &str = "HERDR_NOTIFICATIONS_CLICK_ON_DISMISS";
 
-/// Freedesktop default-action button label. Only rendered on XDG: `action()`
-/// is inert on the default macOS backend, so no hint text promises a button
-/// that isn't there.
-const FOCUS_ACTION_LABEL: &str = "Open in Herdr";
+/// Single actionable toast control. Body/toast click focuses Herdr; this
+/// button only dismisses. Registering a separate `default` action makes
+/// xfce4-notifyd render two buttons, so we rely on daemon-specific body-click
+/// handling instead (see [`dismiss_counts_as_click`]).
+const CLOSE_ACTION_ID: &str = "close";
+const CLOSE_ACTION_LABEL: &str = "Close";
+/// Shown on actionable status toasts; kept short for small notification bodies.
+const CLICK_HINT: &str = "Click to open";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Sound {
@@ -175,6 +181,16 @@ fn format_notification_body(primary: &str, secondary: &str, title: &str, agent: 
 /// path yields a genuine workspace label and tab label. The `herdr pane list`
 /// fallback substitutes the pane's cwd basename and tab id, which read better
 /// in a toast (`herdr-notifications` beats `w1`) but are not workspace labels.
+
+/// Append the short body-click hint for actionable status notifications.
+fn append_click_hint(body: &str) -> String {
+    if body.is_empty() {
+        CLICK_HINT.to_string()
+    } else {
+        format!("{body}\n{CLICK_HINT}")
+    }
+}
+
 fn resolve_location_labels(pane_id: &str, workspace_id: &str) -> (String, String) {
     if let Ok(raw) = env::var("HERDR_PLUGIN_CONTEXT_JSON") {
         if let Ok(ctx) = serde_json::from_str::<PluginContext>(&raw) {
@@ -377,9 +393,13 @@ fn parse_notify_args(args: Vec<String>) -> Result<(String, String, Sound), Strin
 /// process stays alive until the toast is activated or dismissed.
 fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Option<&str>) -> Result<(), ()> {
     let summary = summary.to_string();
-    let body = body.to_string();
-    let click_target = click_target.map(str::to_string);
     let wants_click = click_target.is_some();
+    let body = if wants_click {
+        append_click_hint(body)
+    } else {
+        body.to_string()
+    };
+    let click_target = click_target.map(str::to_string);
 
     let (shown_tx, shown_rx) = mpsc::channel::<Result<(), String>>();
     let (click_tx, click_rx) = mpsc::channel::<Option<String>>();
@@ -396,7 +416,7 @@ fn send_notification(summary: &str, body: &str, sound: Sound, click_target: Opti
             notification.sound_name(name);
         }
         if wants_click {
-            notification.action("default", FOCUS_ACTION_LABEL);
+            notification.action(CLOSE_ACTION_ID, CLOSE_ACTION_LABEL);
             // Leave urgency alone: Normal is already the XDG default, and
             // `urgency()` does not exist on the default macOS backend
             // (notify-rust gates it behind the `preview-macos-un` feature).
@@ -469,14 +489,28 @@ enum ClickOutcome {
 /// so `dismiss_is_click` turns that reading on just for daemons that need it.
 ///
 /// xfce4-notifyd also emits `Dismissed` as show/replace churn immediately
-/// after `show()`, hence the grace window.
+/// after `show()`, hence the grace window. When that churn triggers a
+/// [`ClickOutcome::Rearm`], the next `Dismissed` is the user's body click
+/// even if it still falls inside the grace window.
 fn classify_response(
     response: &NotificationResponse,
     dismiss_is_click: bool,
     since_show: Duration,
+    after_churn_rearm: bool,
 ) -> ClickOutcome {
+    if after_churn_rearm
+        && dismiss_is_click
+        && matches!(
+            response,
+            NotificationResponse::Closed(CloseReason::Dismissed)
+        )
+    {
+        return ClickOutcome::Focus;
+    }
     match response {
-        NotificationResponse::Default | NotificationResponse::Action(_) => ClickOutcome::Focus,
+        NotificationResponse::Default => ClickOutcome::Focus,
+        NotificationResponse::Action(key) if key == CLOSE_ACTION_ID => ClickOutcome::Stop,
+        NotificationResponse::Action(_) => ClickOutcome::Focus,
         NotificationResponse::Closed(CloseReason::Dismissed) if dismiss_is_click => {
             if since_show >= POST_SHOW_LISTEN_GRACE {
                 ClickOutcome::Focus
@@ -486,6 +520,61 @@ fn classify_response(
         }
         _ => ClickOutcome::Stop,
     }
+}
+
+/// Pure simulation of the XDG rearm loop: `(response, elapsed since show)`.
+/// Returns whether a body click should run [`focus_pane`].
+fn click_sequence_should_focus(
+    responses: &[(NotificationResponse, Duration)],
+    dismiss_is_click: bool,
+) -> bool {
+    let mut after_churn_rearm = false;
+    let mut rearms = 0u32;
+    for (response, since_show) in responses {
+        match classify_response(response, dismiss_is_click, *since_show, after_churn_rearm) {
+            ClickOutcome::Focus => return true,
+            ClickOutcome::Stop => return false,
+            ClickOutcome::Rearm => {
+                after_churn_rearm = true;
+                rearms += 1;
+                if rearms > MAX_LISTEN_REARMS {
+                    return false;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Behaviour profile for a notification server / OS (used in unit tests to
+/// replay recorded daemon event sequences without a session bus).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotificationBackend {
+    /// xfce4-notifyd: body click emits only `Dismissed`; show/replace churn too.
+    Xfce,
+    /// GNOME Shell, KDE Plasma, and most freedesktop implementations.
+    Freedesktop,
+    /// dunst / mako.
+    Dunst,
+    /// Windows toast center.
+    Windows,
+    /// macOS notification center.
+    MacOs,
+}
+
+impl NotificationBackend {
+    fn dismiss_is_click(self) -> bool {
+        matches!(self, Self::Xfce)
+    }
+}
+
+/// Replay a daemon-specific event script and return whether [`focus_pane`]
+/// should run for it.
+fn simulate_notification_focus(
+    backend: NotificationBackend,
+    events: &[(NotificationResponse, Duration)],
+) -> bool {
+    click_sequence_should_focus(events, backend.dismiss_is_click())
 }
 
 /// Whether this notification daemon reports a body click only as
@@ -540,7 +629,8 @@ fn wait_for_focus_click(
     dismiss_is_click: bool,
 ) -> bool {
     let id = handle.id();
-    let mut outcome = capture_outcome(shown_at, dismiss_is_click, |handler| {
+    let after_churn_rearm = Arc::new(AtomicBool::new(false));
+    let mut outcome = capture_outcome(shown_at, dismiss_is_click, after_churn_rearm.clone(), |handler| {
         let _ = handle.wait_for_response(handler);
     });
 
@@ -549,7 +639,7 @@ fn wait_for_focus_click(
             ClickOutcome::Focus => return true,
             ClickOutcome::Stop => return false,
             ClickOutcome::Rearm => {
-                outcome = capture_outcome(shown_at, dismiss_is_click, |handler| {
+                outcome = capture_outcome(shown_at, dismiss_is_click, after_churn_rearm.clone(), |handler| {
                     let _ = notify_rust::handle_action(id, |response: &ActionResponse<'_>| {
                         handler.call(&normalize_action_response(response));
                     });
@@ -568,7 +658,7 @@ fn wait_for_focus_click(
 ) -> bool {
     // No re-arm path off XDG: `Dismissed` is never a click on these backends,
     // so nothing is ever classified `Rearm`.
-    capture_outcome(shown_at, dismiss_is_click, |handler| {
+    capture_outcome(shown_at, dismiss_is_click, Arc::new(AtomicBool::new(false)), |handler| {
         let _ = handle.wait_for_response(handler);
     }) == ClickOutcome::Focus
 }
@@ -578,6 +668,7 @@ fn wait_for_focus_click(
 fn capture_outcome(
     shown_at: Instant,
     dismiss_is_click: bool,
+    after_churn_rearm: Arc<AtomicBool>,
     wait: impl FnOnce(OutcomeHandler),
 ) -> ClickOutcome {
     let (tx, rx) = mpsc::channel::<ClickOutcome>();
@@ -585,6 +676,7 @@ fn capture_outcome(
         tx,
         shown_at,
         dismiss_is_click,
+        after_churn_rearm,
     });
     rx.try_recv().unwrap_or(ClickOutcome::Stop)
 }
@@ -596,11 +688,20 @@ struct OutcomeHandler {
     tx: mpsc::Sender<ClickOutcome>,
     shown_at: Instant,
     dismiss_is_click: bool,
+    after_churn_rearm: Arc<AtomicBool>,
 }
 
 impl ResponseHandler for OutcomeHandler {
     fn call(self, response: &NotificationResponse) {
-        let outcome = classify_response(response, self.dismiss_is_click, self.shown_at.elapsed());
+        let outcome = classify_response(
+            response,
+            self.dismiss_is_click,
+            self.shown_at.elapsed(),
+            self.after_churn_rearm.load(Ordering::Relaxed),
+        );
+        if outcome == ClickOutcome::Rearm {
+            self.after_churn_rearm.store(true, Ordering::Relaxed);
+        }
         if outcome == ClickOutcome::Stop {
             eprintln!("herdr-notifications: toast closed without action: {response:?}");
         }
@@ -983,18 +1084,40 @@ mod tests {
     }
 
     #[test]
+    fn append_click_hint_adds_short_line() {
+        assert_eq!(append_click_hint("scripts · tab"), "scripts · tab\nClick to open");
+        assert_eq!(append_click_hint(""), "Click to open");
+    }
+
+    #[test]
+    fn classify_response_close_action_stops_without_focus() {
+        for dismiss_is_click in [true, false] {
+            assert_eq!(
+                classify_response(
+                    &NotificationResponse::Action(CLOSE_ACTION_ID.into()),
+                    dismiss_is_click,
+                    POST_SHOW_LISTEN_GRACE * 2,
+                    false,
+                ),
+                ClickOutcome::Stop
+            );
+        }
+    }
+
+    #[test]
     fn classify_response_treats_activation_as_focus() {
         let grace = POST_SHOW_LISTEN_GRACE;
         for dismiss_is_click in [true, false] {
             assert_eq!(
-                classify_response(&NotificationResponse::Default, dismiss_is_click, grace),
+                classify_response(&NotificationResponse::Default, dismiss_is_click, grace, false),
                 ClickOutcome::Focus
             );
             assert_eq!(
                 classify_response(
                     &NotificationResponse::Action("default".into()),
                     dismiss_is_click,
-                    grace
+                    grace,
+                    false,
                 ),
                 ClickOutcome::Focus
             );
@@ -1008,7 +1131,8 @@ mod tests {
             classify_response(
                 &NotificationResponse::Closed(CloseReason::Dismissed),
                 false,
-                POST_SHOW_LISTEN_GRACE * 2
+                POST_SHOW_LISTEN_GRACE * 2,
+                false,
             ),
             ClickOutcome::Stop
         );
@@ -1020,7 +1144,8 @@ mod tests {
             classify_response(
                 &NotificationResponse::Closed(CloseReason::Dismissed),
                 true,
-                POST_SHOW_LISTEN_GRACE
+                POST_SHOW_LISTEN_GRACE,
+                false,
             ),
             ClickOutcome::Focus
         );
@@ -1033,10 +1158,122 @@ mod tests {
             classify_response(
                 &NotificationResponse::Closed(CloseReason::Dismissed),
                 true,
-                Duration::from_millis(0)
+                Duration::from_millis(0),
+                false,
             ),
             ClickOutcome::Rearm
         );
+    }
+
+    #[test]
+    fn classify_response_focuses_xfce_dismiss_after_churn_rearm_even_inside_grace() {
+        assert_eq!(
+            classify_response(
+                &NotificationResponse::Closed(CloseReason::Dismissed),
+                true,
+                Duration::from_millis(20),
+                true,
+            ),
+            ClickOutcome::Focus
+        );
+    }
+
+    fn dismissed_at(ms: u64) -> (NotificationResponse, Duration) {
+        (
+            NotificationResponse::Closed(CloseReason::Dismissed),
+            Duration::from_millis(ms),
+        )
+    }
+
+    fn default_click_at(ms: u64) -> (NotificationResponse, Duration) {
+        (NotificationResponse::Default, Duration::from_millis(ms))
+    }
+
+    fn close_button_at(ms: u64) -> (NotificationResponse, Duration) {
+        (
+            NotificationResponse::Action(CLOSE_ACTION_ID.into()),
+            Duration::from_millis(ms),
+        )
+    }
+
+    #[test]
+    fn xfce_show_churn_then_body_click_runs_focus() {
+        assert!(simulate_notification_focus(
+            NotificationBackend::Xfce,
+            &[dismissed_at(0), dismissed_at(50)],
+        ));
+    }
+
+    #[test]
+    fn xfce_body_click_after_churn_window_runs_focus() {
+        assert!(simulate_notification_focus(
+            NotificationBackend::Xfce,
+            &[dismissed_at(200)],
+        ));
+    }
+
+    #[test]
+    fn xfce_churn_only_does_not_run_focus() {
+        assert!(!simulate_notification_focus(
+            NotificationBackend::Xfce,
+            &[dismissed_at(0)],
+        ));
+    }
+
+    #[test]
+    fn xfce_close_button_does_not_run_focus() {
+        assert!(!simulate_notification_focus(
+            NotificationBackend::Xfce,
+            &[close_button_at(500)],
+        ));
+    }
+
+    #[test]
+    fn gnome_body_click_runs_focus() {
+        assert!(simulate_notification_focus(
+            NotificationBackend::Freedesktop,
+            &[default_click_at(100)],
+        ));
+    }
+
+    #[test]
+    fn gnome_swipe_dismiss_does_not_run_focus() {
+        assert!(!simulate_notification_focus(
+            NotificationBackend::Freedesktop,
+            &[dismissed_at(100)],
+        ));
+    }
+
+    #[test]
+    fn gnome_close_button_does_not_run_focus() {
+        assert!(!simulate_notification_focus(
+            NotificationBackend::Freedesktop,
+            &[close_button_at(100)],
+        ));
+    }
+
+    #[test]
+    fn dunst_body_click_runs_focus_via_default_action() {
+        assert!(simulate_notification_focus(
+            NotificationBackend::Dunst,
+            &[default_click_at(50)],
+        ));
+    }
+
+    #[test]
+    fn windows_toast_click_runs_focus() {
+        assert!(simulate_notification_focus(
+            NotificationBackend::Windows,
+            &[default_click_at(100)],
+        ));
+    }
+
+    #[test]
+    fn macos_notification_click_runs_focus() {
+        assert!(simulate_notification_focus(
+            NotificationBackend::MacOs,
+            &[default_click_at(100)],
+        ));
     }
 
     #[test]
@@ -1050,7 +1287,8 @@ mod tests {
                 classify_response(
                     &NotificationResponse::Closed(reason),
                     true,
-                    POST_SHOW_LISTEN_GRACE * 2
+                    POST_SHOW_LISTEN_GRACE * 2,
+                    false,
                 ),
                 ClickOutcome::Stop,
                 "{reason:?} is not a click"
